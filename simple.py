@@ -6,7 +6,9 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+
+from torch.optim import Muon
 
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
 from modules.utils import load_checkpoint, save_checkpoint, train_or_load_bpe
@@ -262,52 +264,91 @@ class TokenDataset(Dataset):
         y = self.token_ids[idx + 1 : idx + self.block_size + 1]
         return x, y
 
-def load_tinystories(tokenizer, eot_id):
-    """
-    Load roneneldan/TinyStories and tokenize with the provided custom BPE.
-    Stories are separated by <|endoftext|> so the model learns boundaries.
+# Reserve the first VAL_DOCS documents of the stream for a fixed validation
+# set; training skips past them so it never sees val docs.
+VAL_DOCS = 2000
+
+
+def fineweb_edu_stream(skip=0, take=None):
+    """Stream the 10B-token FineWeb-Edu sample. skip/take operate on documents.
+
+    Streaming avoids downloading the full ~28GB shard set up front; HF fetches
+    parquet shards on demand and caches them as workers consume the iterator.
     """
     from datasets import load_dataset
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        "sample-10BT",
+        split="train",
+        streaming=True,
+    )
+    if skip:
+        ds = ds.skip(skip)
+    if take is not None:
+        ds = ds.take(take)
+    return ds
 
-    print("Loading TinyStories splits...")
-    train_ds = load_dataset("roneneldan/TinyStories", split="train")
-    val_ds   = load_dataset("roneneldan/TinyStories", split="validation")
 
-    def encode_stories(ds):
-        tokens = []
-        # Batch-encode for speed.
-        batch = []
-        BATCH = 1024
-        def flush():
-            if not batch:
-                return
-            encs = tokenizer.encode_batch(batch)
-            for e in encs:
-                tokens.extend(e.ids)
-                tokens.append(eot_id)
-            batch.clear()
-        for row in ds:
-            t = row["text"].strip()
+def precompute_val_tokens(tokenizer, eot_id):
+    """Tokenize the held-out val docs once at startup into a single tensor."""
+    print(f"Tokenizing {VAL_DOCS} FineWeb-Edu docs for validation...")
+    tokens = []
+    batch, BATCH = [], 256
+    def flush():
+        if not batch:
+            return
+        for e in tokenizer.encode_batch(batch):
+            tokens.extend(e.ids)
+            tokens.append(eot_id)
+        batch.clear()
+    for ex in fineweb_edu_stream(take=VAL_DOCS):
+        t = ex["text"].strip()
+        if not t:
+            continue
+        batch.append(t)
+        if len(batch) >= BATCH:
+            flush()
+    flush()
+    print(f"Val tokens: {len(tokens)/1e6:.1f}M")
+    return torch.tensor(tokens, dtype=torch.long)
+
+
+class StreamingTokenDataset(IterableDataset):
+    """
+    Streams FineWeb-Edu, tokenizes on the fly, packs the token stream into a
+    rolling buffer, and yields non-overlapping (x, y) blocks for next-token
+    prediction. Each DataLoader worker takes a distinct shard of the stream
+    so workers don't replay the same documents.
+    """
+
+    def __init__(self, tokenizer, block_size, eot_id, skip_docs=0):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.eot_id = eot_id
+        self.skip_docs = skip_docs
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        ds = fineweb_edu_stream(skip=self.skip_docs)
+        if worker_info is not None:
+            ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+
+        bs = self.block_size
+        buf = []
+        for ex in ds:
+            t = ex["text"].strip()
             if not t:
                 continue
-            batch.append(t)
-            if len(batch) >= BATCH:
-                flush()
-        flush()
-        return tokens
-
-    train_tokens = encode_stories(train_ds)
-    val_tokens   = encode_stories(val_ds)
- 
-    print(
-        f"TinyStories: {len(train_tokens)/1e6:.1f}M train tokens, "
-        f"{len(val_tokens)/1e6:.1f}M val tokens"
-    )
- 
-    return (
-        torch.tensor(train_tokens, dtype=torch.long),
-        torch.tensor(val_tokens,   dtype=torch.long),
-    )
+            buf.extend(self.tokenizer.encode(t).ids)
+            buf.append(self.eot_id)
+            while len(buf) >= bs + 1:
+                x = torch.tensor(buf[:bs],      dtype=torch.long)
+                y = torch.tensor(buf[1:bs + 1], dtype=torch.long)
+                yield x, y
+                # Advance by bs; carry the last token so the next block's y
+                # remains a strict 1-shift of x without re-tokenizing.
+                buf = buf[bs:]
 
 def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
     model.eval()
@@ -324,19 +365,20 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
     return sum(losses) / len(losses) if losses else 0.0
 
 def main():
-    parser = argparse.ArgumentParser(description="SimpleTransformerLM — TinyStories")
+    parser = argparse.ArgumentParser(description="SimpleTransformerLM — FineWeb-Edu (streaming)")
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
     parser.add_argument("--batch-size",   type=int,   default=99,
                         help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
-    parser.add_argument("--block-size",   type=int,   default=1024)
+    parser.add_argument("--block-size",   type=int,   default=2048)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
     parser.add_argument("--resume",       action="store_true",
                         help="Resume training from --checkpoint before running any new steps.")
-    parser.add_argument("--vocab-size",     type=int, default=8192,
-                        help="Custom BPE vocab size. 8k is plenty for TinyStories.")
-    parser.add_argument("--tokenizer-path", type=str, default="tinystories_bpe.json",
+    parser.add_argument("--vocab-size",     type=int, default=32768,
+                        help="Custom BPE vocab size. 32k suits general English web text; "
+                             "8k was fine for TinyStories but starves a model on FineWeb-Edu.")
+    parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json",
                         help="Path to cache the trained BPE tokenizer.")
     parser.add_argument("--compile-mode", type=str,   default="reduce-overhead",
                         choices=["default", "reduce-overhead", "max-autotune"],
@@ -376,13 +418,11 @@ def main():
         print(f"GPU : {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
  
-    # Custom BPE — much smaller vocab than GPT-2's 50257 since TinyStories'
-    # vocabulary is tiny. Trains once and caches to disk.
+    # Train BPE on a sample of the stream — 50k docs (~60M chars) is plenty
+    # for a 32k vocab and avoids materializing the full 10BT shard set.
     def corpus_iter():
-        from datasets import load_dataset
-        ds = load_dataset("roneneldan/TinyStories", split="train")
-        for row in ds:
-            t = row["text"].strip()
+        for ex in fineweb_edu_stream(take=50_000):
+            t = ex["text"].strip()
             if t:
                 yield t
 
@@ -395,15 +435,18 @@ def main():
     encode = lambda s: tokenizer.encode(s).ids
     decode = lambda ids: tokenizer.decode(ids)
 
-    train_data, val_data = load_tinystories(tokenizer, eot_id)
- 
+    val_data = precompute_val_tokens(tokenizer, eot_id)
+
     block_size = args.block_size
- 
-    train_dataset = TokenDataset(train_data, block_size)
-    val_dataset   = TokenDataset(val_data,   block_size)
- 
+
+    train_dataset = StreamingTokenDataset(
+        tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
+    )
+    val_dataset   = TokenDataset(val_data, block_size)
+
     # EPYC 9355: 48C/96T — 12 workers per loader leaves headroom for the main
-    # process and the OS without causing core contention.
+    # process and the OS without causing core contention. Each train worker
+    # streams its own shard of FineWeb-Edu so they don't replay docs.
     loader_kwargs = dict(
         num_workers=12,
         pin_memory=True,
@@ -411,8 +454,10 @@ def main():
         prefetch_factor=4,
         drop_last=True,
     )
- 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  **loader_kwargs)
+
+    # IterableDataset can't be shuffled by the loader — FineWeb-Edu's row order
+    # is already arbitrary across shards, so this is fine for pretraining.
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, **loader_kwargs)
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, **loader_kwargs)
  
     # Pad vocab size to a multiple of 64 for aligned matmuls
@@ -432,31 +477,62 @@ def main():
     # Drop fullgraph=True if modules.layers has graph breaks.
     model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
-    # Fused AdamW: meaningful CPU overhead reduction on EPYC when the optimizer
-    # step is a bottleneck relative to GPU compute.
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-3,
+    # Hybrid optimizer: Muon for 2D body matrices, AdamW for embeddings,
+    # lm_head (tied to token_emb), RMSNorm gains, and LayerScale parameters.
+    # Muon's orthogonalization is only well-defined on matrix-shaped weights.
+    muon_params, adamw_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_body_matrix = (
+            p.ndim == 2
+            and "token_emb" not in name
+            and "lm_head" not in name
+        )
+        (muon_params if is_body_matrix else adamw_params).append(p)
+
+    LR_PEAK = 1e-3
+
+    # adjust_lr_fn="match_rms_adamw" is the Moonshot/Kimi recipe: Muon's
+    # internal update scaling is calibrated so the same LR works as AdamW.
+    muon_opt = Muon(
+        muon_params,
+        lr=LR_PEAK,
+        momentum=0.95,
+        nesterov=True,
+        weight_decay=0.1,
+        adjust_lr_fn="match_rms_adamw",
+    )
+    adamw_opt = torch.optim.AdamW(
+        adamw_params,
+        lr=LR_PEAK,
         betas=(0.9, 0.99),
         weight_decay=0.1,
         fused=(device == "cuda"),
     )
- 
+    optimizers = [muon_opt, adamw_opt]
+
+    print(
+        f"Optimizer split: Muon on {len(muon_params)} matrices, "
+        f"AdamW on {len(adamw_params)} tensors."
+    )
+
     max_steps     = args.max_steps
     eval_interval = 99
     warmup_steps  = min(99, max(0, max_steps - 1))
- 
+
     def get_lr(step):
+        """Linear warmup to LR_PEAK, then cosine down to 10% of peak."""
         if step < warmup_steps:
-            return 1e-3 * step / warmup_steps
+            return LR_PEAK * step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-        return 1e-4 + 0.5 * (1e-3 - 1e-4) * (1 + math.cos(math.pi * progress))
- 
+        return 0.1 * LR_PEAK + 0.5 * (LR_PEAK - 0.1 * LR_PEAK) * (1 + math.cos(math.pi * progress))
+
     step       = 0
     train_iter = iter(train_loader)
 
     if args.resume:
-        loaded_step = load_checkpoint(model, optimizer, args.checkpoint, device)
+        loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
         step = loaded_step + 1
         if step >= max_steps:
             print(
@@ -470,9 +546,10 @@ def main():
  
     while step < max_steps:
         lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
- 
+        for opt in optimizers:
+            for param_group in opt.param_groups:
+                param_group["lr"] = lr
+
         try:
             xb, yb = next(train_iter)
         except StopIteration:
@@ -481,16 +558,18 @@ def main():
 
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
 
         with autocast_ctx:
             logits, _ = model(xb, use_cache=False)
             loss = F.cross_entropy(logits.view(-1, model.vocab_size), yb.view(-1))
- 
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
- 
+        for opt in optimizers:
+            opt.step()
+
         if step % eval_interval == 0:
             val_loss  = estimate_loss(model, val_loader, model.vocab_size, device)
             vram_used = torch.cuda.memory_reserved() / 1e9 if device == "cuda" else 0.0
@@ -499,8 +578,8 @@ def main():
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
                 f"VRAM {vram_used:.1f}GB"
             )
-            save_checkpoint(model, optimizer, step, args.checkpoint)
- 
+            save_checkpoint(model, optimizers, step, args.checkpoint)
+
         step += 1
  
     # -------------------------------------------------------------------------
