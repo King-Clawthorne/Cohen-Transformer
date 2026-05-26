@@ -33,8 +33,10 @@ class SimpleTransformerLM(nn.Module):
         n_layers=12,
         n_heads=12,
         n_embd=768,
+        logit_softcap=30.0,
     ):
         super().__init__()
+        self.logit_softcap = logit_softcap
 
         if n_embd % n_heads != 0:
             raise ValueError("n_embd must be divisible by n_heads")
@@ -54,6 +56,12 @@ class SimpleTransformerLM(nn.Module):
 
         self.qkv = nn.ModuleList([nn.Linear(n_embd, 3 * n_embd, bias=False) for _ in range(n_layers)])
         self.proj = nn.ModuleList([nn.Linear(n_embd, n_embd, bias=False) for _ in range(n_layers)])
+
+        # QK-gain: learnable per-head multiplicative gain on the attention scale.
+        # Init to 1.0 so initial behavior matches the fixed 1/sqrt(d_k) baseline.
+        self.qk_gain = nn.ParameterList([
+            nn.Parameter(torch.ones(n_heads)) for _ in range(n_layers)
+        ])
 
         self.w_up = nn.ModuleList()
         self.w_gate = nn.ModuleList()
@@ -122,6 +130,10 @@ class SimpleTransformerLM(nn.Module):
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
 
+            # QK-gain: fold a learnable per-head gain into q so SDPA's scalar
+            # `scale` still applies. Equivalent to scale * gain[h] per head.
+            q = q * self.qk_gain[layer].view(1, self.n_heads, 1, 1).to(q.dtype)
+
             past_len = 0
             if past_kvs is not None:
                 past_k, past_v = past_kvs[layer]
@@ -163,6 +175,9 @@ class SimpleTransformerLM(nn.Module):
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
+        if self.logit_softcap is not None and self.logit_softcap > 0:
+            cap = self.logit_softcap
+            logits = torch.tanh(logits / cap) * cap
         return logits, new_kvs
 
     @torch.no_grad()
