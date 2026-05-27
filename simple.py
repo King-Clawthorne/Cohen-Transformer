@@ -365,7 +365,7 @@ class StreamingTokenDataset(IterableDataset):
                 # remains a strict 1-shift of x without re-tokenizing.
                 buf = buf[bs:]
 
-def chunked_cross_entropy(logits, targets, chunk_size=4096):
+def chunked_cross_entropy(logits, targets, chunk_size=8192):
     """Cross-entropy that avoids the full-tensor fp32 upcast inside F.cross_entropy.
 
     F.cross_entropy upcasts the entire (N, V) logits tensor to fp32 for
@@ -605,11 +605,13 @@ def main():
 
         if step % eval_interval == 0:
             val_loss  = estimate_loss(model, val_loader, model.vocab_size, device)
-            vram_used = torch.cuda.memory_reserved() / 1e9 if device == "cuda" else 0.0
+            peak_alloc = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
+            peak_reserved = torch.cuda.max_memory_reserved() / 1e9 if device == "cuda" else 0.0
+            if device == "cuda": torch.cuda.reset_peak_memory_stats()
             print(
                 f"step {step:04d} | lr {lr:.2e} | "
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
-                f"VRAM {vram_used:.1f}GB"
+                f"peak active {peak_alloc:.1f}GB | peak reserved {peak_reserved:.1f}GB"
             )
             save_checkpoint(model, optimizers, step, args.checkpoint)
 
