@@ -13,6 +13,10 @@ from torch.optim import Muon
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
 from modules.utils import load_checkpoint, save_checkpoint, train_or_load_bpe
 
+import torch._inductor.config as ic
+ic.coordinate_descent_tuning = True
+ic.coordinate_descent_check_all_directions = True   # slower compile, more thoroughput
+
 # EPYC 9355: 48 cores / 96 threads. Cap PyTorch + MKL thread pools to avoid
 # contention with DataLoader workers (we use 12 workers below).
 os.environ.setdefault("OMP_NUM_THREADS", "8")
