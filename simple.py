@@ -384,8 +384,7 @@ def main():
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
-    parser.add_argument("--batch-size",   type=int,   default=99,
-                        help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
+    parser.add_argument("--batch-size",   type=int,   default=99)
     parser.add_argument("--block-size",   type=int,   default=2048)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
     parser.add_argument("--resume",       action="store_true",
