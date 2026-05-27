@@ -481,14 +481,7 @@ def main():
                         help="Cap on training tokens to write (default 1B). None = full 10B sample.")
     parser.add_argument("--pretokenize-train-docs",   type=int, default=None,
                         help="Optional doc cap; whichever of docs/tokens hits first stops the writer.")
-
-    # FP8: convert body Linear layers to rowwise-scaled FP8 via torchao.
-    # ~1.5-1.8x training speedup on Blackwell tensor cores; BF16 autocast still
-    # wraps the forward so non-FP8 ops (RMSNorm, attention, LayerScale) keep
-    # BF16 precision. Requires: pip install torchao>=0.7, Blackwell/Hopper GPU.
-    parser.add_argument("--fp8", action="store_true",
-                        help="Convert body Linear layers to FP8 (torchao rowwise).")
-
+    
     parser.add_argument("--compile-mode", type=str,   default="max-autotune",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode. max-autotune is best for Blackwell long runs "
@@ -623,32 +616,6 @@ def main():
  
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params / 1e6:.1f}M")
-
-    if args.fp8:
-        # Convert body matmuls (qkv / proj / w_up / w_gate / w_down) to FP8.
-        # Skip:
-        #   - lm_head: tied to token_emb; FP8 conversion would orphan the tie
-        #     and the embedding lookup itself can't run in FP8 anyway.
-        #   - any Linear whose in/out dim isn't divisible by 16 (FP8 tile size).
-        # Must run AFTER .to(device) and BEFORE torch.compile so the compiled
-        # graph captures the FP8 Linear modules.
-        from torchao.float8 import convert_to_float8_training, Float8LinearConfig
-        from torchao.float8.config import Float8LinearRecipeName
-
-        fp8_config = Float8LinearConfig.from_recipe_name(Float8LinearRecipeName.ROWWISE)
-
-        def fp8_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if "lm_head" in fqn:
-                return False
-            return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
-
-        n_before = sum(isinstance(m, nn.Linear) for m in model.modules())
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_filter)
-        from torchao.float8.float8_linear import Float8Linear
-        n_fp8 = sum(isinstance(m, Float8Linear) for m in model.modules())
-        print(f"FP8 conversion: {n_fp8}/{n_before} Linear layers converted to rowwise FP8.")
 
     # max-autotune: Blackwell has enough SRAM for the autotuner to find optimal
     # tile configs. First-step compile will be slow (~5-10 min).
