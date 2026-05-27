@@ -365,6 +365,25 @@ class StreamingTokenDataset(IterableDataset):
                 # remains a strict 1-shift of x without re-tokenizing.
                 buf = buf[bs:]
 
+def chunked_cross_entropy(logits, targets, chunk_size=4096):
+    """Cross-entropy that avoids the full-tensor fp32 upcast inside F.cross_entropy.
+
+    F.cross_entropy upcasts the entire (N, V) logits tensor to fp32 for
+    log_softmax. For large B*T*V (e.g. 99*2048*32832), that fp32 copy alone is
+    ~26 GB. Chunking along N caps the upcast at chunk_size * V * 4 bytes.
+    """
+    logits = logits.view(-1, logits.size(-1))
+    targets = targets.view(-1)
+    n = targets.numel()
+    total = logits.new_zeros((), dtype=torch.float32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        total = total + F.cross_entropy(
+            logits[start:end], targets[start:end], reduction="sum"
+        )
+    return total / n
+
+
 def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
     model.eval()
     losses = []
@@ -373,7 +392,7 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
             logits, _ = model(xb, use_cache=False)
-            loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+            loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
     
     model.train()
@@ -577,7 +596,7 @@ def main():
 
         with autocast_ctx:
             logits, _ = model(xb, use_cache=False)
-            loss = F.cross_entropy(logits.view(-1, model.vocab_size), yb.view(-1))
+            loss = chunked_cross_entropy(logits, yb)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
