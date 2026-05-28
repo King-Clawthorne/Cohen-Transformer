@@ -14,6 +14,8 @@ from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
 from modules.utils import load_checkpoint, save_checkpoint, train_or_load_bpe
 
 import torch._inductor.config as ic
+
+ic.triton.cudagraph_trees = True
 ic.coordinate_descent_tuning = True
 ic.coordinate_descent_check_all_directions = True   # slower compile, more thoroughput
 
