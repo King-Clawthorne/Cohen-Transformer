@@ -125,7 +125,7 @@ class SimpleTransformerLM(nn.Module):
             nn.Linear(n_embd, n_embd, bias=False) for _ in range(n_layers)
         ])
         self.dwa_k = nn.Linear(n_embd, n_embd, bias=False)
-        _dwa_bias_init = 6.0
+        _dwa_bias_init = 3.0
         self.dwa_bias = nn.ParameterList([
             nn.Parameter(torch.tensor(_dwa_bias_init)) for _ in range(n_layers)
         ])
