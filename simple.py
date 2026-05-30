@@ -425,6 +425,7 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            torch.compiler.cudagraph_mark_step_begin()
             logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
@@ -491,7 +492,7 @@ def main():
     )
     val_dataset   = TokenDataset(val_data, block_size)
 
-    # EPYC 9355: 48C/96T — 12 workers per loader leaves headroom for the main
+    # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
     # process and the OS without causing core contention. Each train worker
     # streams its own shard of FineWeb-Edu so they don't replay docs.
     loader_kwargs = dict(
@@ -609,6 +610,10 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+        # cudagraph_trees reuses static buffers across replays; mark the start of
+        # each iteration so outputs from the previous step (forward, backward, and
+        # the compiled Muon step) are treated as dead and their memory reclaimed.
+        torch.compiler.cudagraph_mark_step_begin()
         with autocast_ctx:
             logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
