@@ -39,6 +39,7 @@ class SimpleTransformerLM(nn.Module):
         n_layers=12,
         n_heads=12,
         n_embd=768,
+        n_dwa_heads=None,
         logit_softcap=30.0,
     ):
         super().__init__()
@@ -54,6 +55,14 @@ class SimpleTransformerLM(nn.Module):
         self.n_embd = n_embd
         self.head_dim = n_embd // n_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Heads for the depth-attention residual mixing (see below). Defaults to
+        # the main attention head count.
+        self.n_dwa_heads = n_dwa_heads if n_dwa_heads is not None else n_heads
+        if n_embd % self.n_dwa_heads != 0:
+            raise ValueError("n_embd must be divisible by n_dwa_heads")
+        self.dwa_head_dim = n_embd // self.n_dwa_heads
+        self.dwa_scale = 1.0 / math.sqrt(self.dwa_head_dim)
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
@@ -92,21 +101,34 @@ class SimpleTransformerLM(nn.Module):
             nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
         ])
 
-        # DenseFormer depth-weighted averaging (Pagliardini et al. 2024).
-        # After block i, the residual stream is recomputed as a learnable
-        # weighted sum of the embedding (Y_0) and every block output so far
-        # (Y_1..Y_{i+1}). This lets different depths emphasize different earlier
-        # layers — e.g. block 5 leaning on block 3 while block 6 leans on block 2
-        # — which a single additive residual stream cannot express.
+        # Depth attention (input-dependent residual mixing). After block i, the
+        # residual stream entering block i+1 is recomputed by attending over the
+        # embedding (Y_0) and every block output so far (Y_1..Y_{i+1}) along the
+        # *depth* axis, independently per token position. This generalizes
+        # DenseFormer's static weighted sum (Pagliardini et al. 2024): instead of
+        # one fixed weight per source layer, the mixing weights are produced by
+        # attention, so they depend on the input token. Layer 3's output can
+        # matter most to layer 5 for one token and layer 2 for another.
         #
-        # dwa[i] holds the i+2 mixing weights for block i, initialized one-hot on
-        # the most recent output (weight 1.0 on Y_{i+1}, 0 elsewhere) so the model
-        # starts identical to a standard residual network.
-        self.dwa = nn.ParameterList()
-        for i in range(n_layers):
-            w = torch.zeros(i + 2)
-            w[-1] = 1.0
-            self.dwa.append(nn.Parameter(w))
+        #   query  — per-block dwa_q[i], asked from the most recent output Y_{i+1}
+        #   key    — shared dwa_k, projecting each candidate output (cached, so a
+        #            given output's key is computed once regardless of depth)
+        #   value  — the candidate outputs themselves, split across n_dwa_heads,
+        #            so the mix stays in residual space and each head (channel
+        #            group) can pull from a different source depth
+        #
+        # Identity-at-init: dwa_q is zero-initialized and a large recency bias is
+        # added to the most-recent candidate's logit, so softmax starts ~one-hot
+        # on Y_{i+1} and the stack begins ~identical to a standard residual
+        # network — then learns to spread weight onto earlier layers.
+        self.dwa_q = nn.ModuleList([
+            nn.Linear(n_embd, n_embd, bias=False) for _ in range(n_layers)
+        ])
+        self.dwa_k = nn.Linear(n_embd, n_embd, bias=False)
+        _dwa_bias_init = 6.0
+        self.dwa_bias = nn.ParameterList([
+            nn.Parameter(torch.tensor(_dwa_bias_init)) for _ in range(n_layers)
+        ])
 
         self.ln_f = RMSNorm(n_embd)
 
@@ -125,12 +147,43 @@ class SimpleTransformerLM(nn.Module):
                 mean=0.0,
                 std=0.02 / math.sqrt(2 * n_layers),
             )
+            # Zero query → depth-attention logits start at 0, so the recency bias
+            # alone sets the init mix (~one-hot on the latest output). Only the
+            # query is zeroed (not the shared key) so gradients still flow.
+            nn.init.zeros_(self.dwa_q[i].weight)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _mix_residual(self, layer, block_outputs, dwa_keys):
+        """Input-dependent residual mixing via attention over the depth axis.
+
+        Replaces DenseFormer's static weighted sum. For each token position
+        independently, attend over the candidate outputs Y_0..Y_{i+1}: the query
+        comes from the latest output, keys from every candidate (precomputed in
+        `dwa_keys`), and the values are the candidate outputs split across heads.
+        The result is a per-token, per-head convex combination of earlier layers,
+        so the chosen source depth changes with the input token.
+        """
+        x = block_outputs[-1]
+        bsz, seq_len, _ = x.shape
+        M = len(block_outputs)                       # candidate count (= layer + 2)
+        H, hd = self.n_dwa_heads, self.dwa_head_dim
+
+        q = self.dwa_q[layer](x).view(bsz, seq_len, H, hd)
+        K = torch.stack(dwa_keys, dim=2).view(bsz, seq_len, M, H, hd)
+        V = torch.stack(block_outputs, dim=2).view(bsz, seq_len, M, H, hd)
+
+        logits = torch.einsum("bthd,btmhd->bhtm", q, K) * self.dwa_scale
+        # Recency bias on the most-recent candidate (last along M) → ~identity mix
+        # at init, where the zero-query makes the dot-product logits vanish.
+        bias = torch.cat([logits.new_zeros(M - 1), self.dwa_bias[layer].view(1)])
+        weights = (logits + bias).softmax(dim=-1)            # [B, H, T, M]
+        mixed = torch.einsum("bhtm,btmhd->bthd", weights, V) # [B, T, H, hd]
+        return mixed.reshape(bsz, seq_len, self.n_embd)
 
     def forward(self, idx, past_kvs=None, use_cache=False):
         bsz, seq_len = idx.shape
@@ -139,9 +192,11 @@ class SimpleTransformerLM(nn.Module):
 
         x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
-        # DenseFormer: keep every block output (Y_0 = embedding) so each block's
-        # input can be a learnable weighted average over all of them.
+        # Depth attention: keep every block output (Y_0 = embedding) plus its
+        # shared key projection so each block can attend over all of them. Keys
+        # are cached here so a given output is projected once, not once per depth.
         block_outputs = [x]
+        dwa_keys = [self.dwa_k(x)]
         for layer in range(self.n_layers):
             residual = x
             x_norm = self.ln1[layer](x)
@@ -198,13 +253,11 @@ class SimpleTransformerLM(nn.Module):
             x = residual + self.ls_mlp[layer] * mlp_out
             if use_cache: new_kvs.append((k, v))
 
-            # Depth-weighted average: recompute the residual stream entering the
-            # next block as Σ_k dwa[layer][k] · block_outputs[k].
+            # Depth attention: recompute the residual stream entering the next
+            # block as an input-dependent mix over all outputs so far.
             block_outputs.append(x)
-            w = self.dwa[layer].to(x.dtype)
-            x = w[0] * block_outputs[0]
-            for k in range(1, len(block_outputs)):
-                x = x + w[k] * block_outputs[k]
+            dwa_keys.append(self.dwa_k(x))
+            x = self._mix_residual(layer, block_outputs, dwa_keys)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -528,14 +581,15 @@ def main():
         model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
     # Hybrid optimizer with three parameter groups:
-    #   - Muon for the 2D body matrices (orthogonalization needs matrix weights).
+    #   - Muon for the 2D body matrices (orthogonalization needs matrix weights),
+    #     including the depth-attention query/key projections (dwa_q, dwa_k).
     #   - AdamW *with* weight decay for the token embedding (tied to lm_head): a
     #     large matrix where decay genuinely limits overfitting.
-    #   - AdamW *without* weight decay for the 1D parameters — RMSNorm gains,
-    #     qk_gain, LayerScale, and the DenseFormer dwa weights. Their optimal
-    #     values aren't near zero (dwa even starts at 1.0 on the identity path),
-    #     so decay would just fight the init while regularizing a negligible
-    #     fraction of the parameters.
+    #   - AdamW *without* weight decay for the 1D/scalar parameters — RMSNorm
+    #     gains, qk_gain, LayerScale, and the depth-attention recency biases
+    #     (dwa_bias, which start high to seed the identity mix). Their optimal
+    #     values aren't near zero, so decay would just fight the init while
+    #     regularizing a negligible fraction of the parameters.
     muon_params, adamw_decay, adamw_nodecay = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
