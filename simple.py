@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
 from torch.optim import Muon
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
 from modules.utils import load_checkpoint, save_checkpoint, train_or_load_bpe
@@ -117,7 +116,7 @@ class SimpleTransformerLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, past_kvs=None, use_cache=False, block_mask=None):
+    def forward(self, idx, past_kvs=None, use_cache=False):
         bsz, seq_len = idx.shape
         if seq_len > self.block_size:
             raise ValueError("Sequence length exceeds block_size")
@@ -148,33 +147,26 @@ class SimpleTransformerLM(nn.Module):
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
 
-            if block_mask is not None:
-                # Training / eval: FlexAttention with a per-document
-                # block-diagonal causal mask so tokens never attend across
-                # <|endoftext|> boundaries within a packed sequence. qk_gain is
-                # already folded into q, so the scalar `scale` matches SDPA.
-                y = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
-            else:
-                attn_mask = None
-                is_causal = True
-                if past_len > 0:
-                    # PyTorch's built-in causal mask for non-square attention is
-                    # upper-left aligned, which is wrong for KV-cache decode.
-                    # Build the lower-right mask explicitly so each query token can
-                    # attend to the entire cache plus earlier tokens in this chunk.
-                    total_len = past_len + seq_len
-                    query_positions = past_len + torch.arange(seq_len, device=q.device)
-                    key_positions = torch.arange(total_len, device=q.device)
-                    attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-                    is_causal = False
+            attn_mask = None
+            is_causal = True
+            if past_len > 0:
+                # PyTorch's built-in causal mask for non-square attention is
+                # upper-left aligned, which is wrong for KV-cache decode.
+                # Build the lower-right mask explicitly so each query token can
+                # attend to the entire cache plus earlier tokens in this chunk.
+                total_len = past_len + seq_len
+                query_positions = past_len + torch.arange(seq_len, device=q.device)
+                key_positions = torch.arange(total_len, device=q.device)
+                attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                is_causal = False
 
-                y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=0.0,
-                    is_causal=is_causal,
-                    scale=self.scale,
-                )
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+                scale=self.scale,
+            )
 
             y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
             y = self.proj[layer](y)
@@ -380,34 +372,6 @@ class StreamingTokenDataset(IterableDataset):
                 # remains a strict 1-shift of x without re-tokenizing.
                 buf = buf[bs:]
 
-def build_doc_block_mask(tokens, eot_id):
-    """FlexAttention block mask: block-diagonal causal attention per document.
-
-    Packed sequences join FineWeb-Edu docs with <|endoftext|>. Without masking a
-    token attends across that boundary into an unrelated document. This builds a
-    mask where query q attends to key k iff k <= q (causal) AND both lie in the
-    same document.
-
-    Built eagerly each step and passed into the compiled model — the standard
-    FlexAttention pattern (mask creation stays in eager, consumption is fused).
-    """
-    bsz, seq_len = tokens.shape
-    is_eot = (tokens == eot_id).to(torch.int32)
-    # Exclusive cumsum: the <|endoftext|> token keeps the id of the document it
-    # terminates; the first token after it starts the next id.
-    doc_id = is_eot.cumsum(dim=1) - is_eot  # (B, S)
-
-    def doc_causal_mask(b, h, q_idx, kv_idx):
-        causal = q_idx >= kv_idx
-        same_doc = doc_id[b, q_idx] == doc_id[b, kv_idx]
-        return causal & same_doc
-
-    # H=None broadcasts the same mask across all heads.
-    return create_block_mask(
-        doc_causal_mask, bsz, None, seq_len, seq_len, device=tokens.device
-    )
-
-
 def chunked_cross_entropy(logits, targets, chunk_size=8192):
     """Cross-entropy that avoids the full-tensor fp32 upcast inside F.cross_entropy.
 
@@ -427,15 +391,14 @@ def chunked_cross_entropy(logits, targets, chunk_size=8192):
     return total / n
 
 
-def estimate_loss(model, val_loader, device, eot_id, eval_iters=20):
+def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
     model.eval()
     losses = []
     with torch.no_grad():
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            block_mask = build_doc_block_mask(xb, eot_id)
-            logits, _ = model(xb, use_cache=False, block_mask=block_mask)
+            logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
     
@@ -575,7 +538,7 @@ def main():
     )
 
     max_steps     = args.max_steps
-    eval_interval = 99
+    eval_interval = 999
     warmup_steps  = min(99, max(0, max_steps - 1))
 
     def get_lr(step):
@@ -618,9 +581,8 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        block_mask = build_doc_block_mask(xb, eot_id)
         with autocast_ctx:
-            logits, _ = model(xb, use_cache=False, block_mask=block_mask)
+            logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
 
         loss.backward()
@@ -629,7 +591,7 @@ def main():
             opt.step()
 
         if step % eval_interval == 0:
-            val_loss  = estimate_loss(model, val_loader, device, eot_id)
+            val_loss  = estimate_loss(model, val_loader, model.vocab_size, device)
             peak_alloc = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
             peak_reserved = torch.cuda.max_memory_reserved() / 1e9 if device == "cuda" else 0.0
             if device == "cuda": torch.cuda.reset_peak_memory_stats()
