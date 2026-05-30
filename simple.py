@@ -91,7 +91,23 @@ class SimpleTransformerLM(nn.Module):
         self.ls_mlp = nn.ParameterList([
             nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
         ])
- 
+
+        # DenseFormer depth-weighted averaging (Pagliardini et al. 2024).
+        # After block i, the residual stream is recomputed as a learnable
+        # weighted sum of the embedding (Y_0) and every block output so far
+        # (Y_1..Y_{i+1}). This lets different depths emphasize different earlier
+        # layers — e.g. block 5 leaning on block 3 while block 6 leans on block 2
+        # — which a single additive residual stream cannot express.
+        #
+        # dwa[i] holds the i+2 mixing weights for block i, initialized one-hot on
+        # the most recent output (weight 1.0 on Y_{i+1}, 0 elsewhere) so the model
+        # starts identical to a standard residual network.
+        self.dwa = nn.ParameterList()
+        for i in range(n_layers):
+            w = torch.zeros(i + 2)
+            w[-1] = 1.0
+            self.dwa.append(nn.Parameter(w))
+
         self.ln_f = RMSNorm(n_embd)
 
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
@@ -123,6 +139,9 @@ class SimpleTransformerLM(nn.Module):
 
         x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
+        # DenseFormer: keep every block output (Y_0 = embedding) so each block's
+        # input can be a learnable weighted average over all of them.
+        block_outputs = [x]
         for layer in range(self.n_layers):
             residual = x
             x_norm = self.ln1[layer](x)
@@ -178,6 +197,14 @@ class SimpleTransformerLM(nn.Module):
             mlp_out = self.w_down[layer](F.silu(gate) * up)
             x = residual + self.ls_mlp[layer] * mlp_out
             if use_cache: new_kvs.append((k, v))
+
+            # Depth-weighted average: recompute the residual stream entering the
+            # next block as Σ_k dwa[layer][k] · block_outputs[k].
+            block_outputs.append(x)
+            w = self.dwa[layer].to(x.dtype)
+            x = w[0] * block_outputs[0]
+            for k in range(1, len(block_outputs)):
+                x = x + w[k] * block_outputs[k]
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

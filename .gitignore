@@ -1,0 +1,3 @@
+# Python bytecode cache (matches ./__pycache__/ and modules/__pycache__/)
+__pycache__/
+*.py[cod]

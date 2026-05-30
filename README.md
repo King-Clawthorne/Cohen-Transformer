@@ -10,9 +10,10 @@ Provide a clear, concise project overview and usage guide that helps a developer
 
 ## Action
 
-- Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py` with multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE), LayerScale residual gating, weight-tied embeddings/lm_head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers.
+- Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py` with multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE), a learnable per-head QK-gain on the attention scale, LayerScale residual gating, DenseFormer depth-weighted residual averaging (each block reads a learnable weighted sum of all earlier block outputs), tanh logit soft-capping, weight-tied embeddings/lm_head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers.
 - Switched the optimizer to `torch.optim.Muon` for the body's 2D weight matrices (Newton-Schulz–orthogonalized momentum with the Moonshot `match_rms_adamw` LR adjustment) paired with AdamW for embeddings, RMSNorm gains, and LayerScale vectors.
 - Swapped training data from TinyStories to a streaming `HuggingFaceFW/fineweb-edu` `sample-10BT` pipeline: per-worker shard splitting on an `IterableDataset`, a pre-tokenized held-out val set, and a 32k custom BPE trained on a 50k-doc sample.
+- Tuned the training path for a single Blackwell-class GPU: BF16 autocast, TF32 matmuls, `torch.compile` (fullgraph) over both the model and the Muon optimizer step, PyTorch Inductor cudagraph trees + coordinate-descent autotuning, and a chunked cross-entropy that caps the fp32 log-softmax upcast to avoid multi-GB activation spikes on large vocab × batch × sequence.
 - Centralized tokenizer training and (multi-optimizer) checkpointing in `modules/utils.py` and core building blocks (`RMSNorm`, `RotaryEmbedding`, `apply_rope`) in `modules/layers.py`.
 
 ## Result
@@ -26,7 +27,7 @@ Provide a clear, concise project overview and usage guide that helps a developer
 1. Install dependencies:
 
    ```bash
-   pip install requirments.txt
+   pip install -r requirements.txt
    ```
 
 2. Train (downloads FineWeb-Edu parquet shards lazily on first run):
