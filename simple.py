@@ -530,6 +530,7 @@ def main():
         weight_decay=0.1,
         fused=(device == "cuda"),
     )
+    muon_opt.step = torch.compile(muon_opt.step, mode=args.compile_mode)
     optimizers = [muon_opt, adamw_opt]
 
     print(
