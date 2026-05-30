@@ -425,7 +425,6 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            torch.compiler.cudagraph_mark_step_begin()
             logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
@@ -558,7 +557,6 @@ def main():
         weight_decay=0.1,
         fused=(device == "cuda"),
     )
-    muon_opt.step = torch.compile(muon_opt.step, mode=args.compile_mode)
     optimizers = [muon_opt, adamw_opt]
 
     print(
@@ -610,10 +608,6 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        # cudagraph_trees reuses static buffers across replays; mark the start of
-        # each iteration so outputs from the previous step (forward, backward, and
-        # the compiled Muon step) are treated as dead and their memory reclaimed.
-        torch.compiler.cudagraph_mark_step_begin()
         with autocast_ctx:
             logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
