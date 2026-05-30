@@ -524,10 +524,16 @@ def main():
     # Drop fullgraph=True if modules.layers has graph breaks.
     model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
-    # Hybrid optimizer: Muon for 2D body matrices, AdamW for embeddings,
-    # lm_head (tied to token_emb), RMSNorm gains, and LayerScale parameters.
-    # Muon's orthogonalization is only well-defined on matrix-shaped weights.
-    muon_params, adamw_params = [], []
+    # Hybrid optimizer with three parameter groups:
+    #   - Muon for the 2D body matrices (orthogonalization needs matrix weights).
+    #   - AdamW *with* weight decay for the token embedding (tied to lm_head): a
+    #     large matrix where decay genuinely limits overfitting.
+    #   - AdamW *without* weight decay for the 1D parameters — RMSNorm gains,
+    #     qk_gain, LayerScale, and the DenseFormer dwa weights. Their optimal
+    #     values aren't near zero (dwa even starts at 1.0 on the identity path),
+    #     so decay would just fight the init while regularizing a negligible
+    #     fraction of the parameters.
+    muon_params, adamw_decay, adamw_nodecay = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -536,7 +542,12 @@ def main():
             and "token_emb" not in name
             and "lm_head" not in name
         )
-        (muon_params if is_body_matrix else adamw_params).append(p)
+        if is_body_matrix:
+            muon_params.append(p)
+        elif p.ndim >= 2:
+            adamw_decay.append(p)
+        else:
+            adamw_nodecay.append(p)
 
     LR_PEAK = 1e-3
 
@@ -551,17 +562,20 @@ def main():
         adjust_lr_fn="match_rms_adamw",
     )
     adamw_opt = torch.optim.AdamW(
-        adamw_params,
+        [
+            {"params": adamw_decay,   "weight_decay": 0.1},
+            {"params": adamw_nodecay, "weight_decay": 0.0},
+        ],
         lr=LR_PEAK,
         betas=(0.9, 0.99),
-        weight_decay=0.1,
         fused=(device == "cuda"),
     )
     optimizers = [muon_opt, adamw_opt]
 
     print(
         f"Optimizer split: Muon on {len(muon_params)} matrices, "
-        f"AdamW on {len(adamw_params)} tensors."
+        f"AdamW(wd) on {len(adamw_decay)} matrices, "
+        f"AdamW(no wd) on {len(adamw_nodecay)} vectors."
     )
 
     max_steps     = args.max_steps
