@@ -64,9 +64,6 @@ Provide a clear, concise project overview and usage guide that helps a developer
 - `modules/layers.py` — `RMSNorm`, `RotaryEmbedding`, `apply_rope`
 - `modules/utils.py` — BPE training/loading, sync + async checkpoint save/load (single or list of optimizers), `pretokenize_to_bin` writer, dataset helpers
 
-## Notes
-
-This README follows the STAR method: Situation, Task, Action, Result.
-Things I want to add in the future:
+## Things I want to add in the future:
 1. Flex attention with document masking
 2. A better design for the residual stream
