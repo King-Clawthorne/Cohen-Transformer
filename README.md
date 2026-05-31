@@ -26,7 +26,7 @@ Provide a clear, concise project overview and usage guide that helps a developer
 1. Install dependencies:
 
    ```bash
-   pip install requirments.txt
+   pip install -r requirments.txt
    ```
 
 2. Train (downloads FineWeb-Edu parquet shards lazily on first run):

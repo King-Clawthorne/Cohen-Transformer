@@ -379,8 +379,8 @@ def chunked_cross_entropy(logits, targets, chunk_size=8192):
     log_softmax. For large B*T*V (e.g. 99*2048*32832), that fp32 copy alone is
     ~26 GB. Chunking along N caps the upcast at chunk_size * V * 4 bytes.
     """
-    logits = logits.view(-1, logits.size(-1))
-    targets = targets.view(-1)
+    logits = logits.reshape(-1, logits.size(-1))
+    targets = targets.reshape(-1)
     n = targets.numel()
     total = logits.new_zeros((), dtype=torch.float32)
     for start in range(0, n, chunk_size):
@@ -391,7 +391,7 @@ def chunked_cross_entropy(logits, targets, chunk_size=8192):
     return total / n
 
 
-def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
+def estimate_loss(model, val_loader, device, eval_iters=20):
     model.eval()
     losses = []
     with torch.no_grad():
@@ -465,7 +465,7 @@ def main():
     )
     val_dataset   = TokenDataset(val_data, block_size)
 
-    # EPYC 9355: 48C/96T — 12 workers per loader leaves headroom for the main
+    # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
     # process and the OS without causing core contention. Each train worker
     # streams its own shard of FineWeb-Edu so they don't replay docs.
     loader_kwargs = dict(
@@ -592,7 +592,7 @@ def main():
             opt.step()
 
         if step % eval_interval == 0:
-            val_loss  = estimate_loss(model, val_loader, model.vocab_size, device)
+            val_loss  = estimate_loss(model, val_loader, device)
             peak_alloc = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
             peak_reserved = torch.cuda.max_memory_reserved() / 1e9 if device == "cuda" else 0.0
             if device == "cuda": torch.cuda.reset_peak_memory_stats()
