@@ -1,8 +1,11 @@
+import json
+import threading
 import torch
 import torch.nn as nn
+import numpy as np
 from pathlib import Path
 from datasets import load_dataset
-from typing import Optional
+from typing import Optional, Iterable
 
 
 def train_or_load_bpe(corpus_iter, vocab_size: int, save_path: str):
@@ -40,6 +43,78 @@ def train_or_load_bpe(corpus_iter, vocab_size: int, save_path: str):
     print(f"Tokenizer saved to {save_path} (vocab={tok.get_vocab_size()})")
     return tok
 
+def pretokenize_to_bin(
+    docs_iter: Iterable[str],
+    tokenizer,
+    eot_id: int,
+    out_path: str,
+    dtype=np.uint16,
+    batch_size: int = 1024,
+    max_tokens: Optional[int] = None,
+    log_every_docs: int = 100_000,
+):
+    """Stream `docs_iter`, tokenize in batches, and append token ids to a flat
+    binary file at `out_path`. Writes a sidecar `<out_path>.json` with dtype +
+    token count so readers can mmap without guessing.
+
+    uint16 fits any vocab up to 65,535 (the project's 32k BPE fits with room).
+    Bump to uint32 if you ever train a >64k vocab.
+    """
+    np_dtype = np.dtype(dtype)
+    if np_dtype == np.uint16 and tokenizer.get_vocab_size() > 65535:
+        raise ValueError("Vocab exceeds uint16 range; pass dtype=np.uint32.")
+
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    docs_seen = 0
+    batch: list[str] = []
+
+    def flush(f):
+        nonlocal total
+        if not batch:
+            return
+        ids: list[int] = []
+        for e in tokenizer.encode_batch(batch):
+            ids.extend(e.ids)
+            ids.append(eot_id)
+        arr = np.asarray(ids, dtype=np_dtype)
+        if max_tokens is not None and total + len(arr) > max_tokens:
+            arr = arr[: max_tokens - total]
+        f.write(arr.tobytes())
+        total += len(arr)
+        batch.clear()
+
+    with open(p, "wb") as f:
+        for text in docs_iter:
+            text = text.strip()
+            if not text:
+                continue
+            batch.append(text)
+            docs_seen += 1
+            if len(batch) >= batch_size:
+                flush(f)
+                if docs_seen % log_every_docs < batch_size:
+                    print(f"  pretokenized {docs_seen:>9,} docs | {total/1e6:>8.1f}M tokens")
+            if max_tokens is not None and total >= max_tokens:
+                break
+        flush(f)
+
+    meta = {"dtype": np_dtype.name, "num_tokens": total, "vocab_size": tokenizer.get_vocab_size()}
+    Path(str(p) + ".json").write_text(json.dumps(meta, indent=2))
+    print(f"Wrote {total/1e6:.1f}M tokens ({docs_seen:,} docs) to {out_path}")
+    return total
+
+
+def load_pretokenized_meta(bin_path: str) -> dict:
+    """Read the sidecar metadata written by `pretokenize_to_bin`."""
+    meta_path = Path(str(bin_path) + ".json")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"No sidecar metadata at {meta_path}")
+    return json.loads(meta_path.read_text())
+
+
 def init_weights(module: nn.Module, std: float = 0.02):
     """GPT-2 style weight initialization."""
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -73,6 +148,102 @@ def save_checkpoint(
         checkpoint.update(extra)
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path} at step {step}")
+
+
+class AsyncCheckpointer:
+    """Non-blocking checkpoint writer.
+
+    Each `save()` call:
+      1. Snapshots model + optimizer state dicts to pinned CPU memory on the
+         main thread (this is the only part that has to be synchronous — it's
+         the GPU->host copy and it must capture a consistent state before
+         training mutates weights for step N+1).
+      2. Hands the CPU snapshot to a background thread that runs `torch.save`.
+
+    The next `save()` call (or `close()` at shutdown) waits for the previous
+    write to finish before kicking off a new one — so at most one outstanding
+    write exists at a time, and a slow disk applies backpressure to training
+    rather than silently piling up snapshots in RAM.
+    """
+
+    def __init__(self):
+        self._thread: Optional[threading.Thread] = None
+        self._error: Optional[BaseException] = None
+
+    @staticmethod
+    def _snapshot_state_dict(sd: dict) -> dict:
+        """Move every tensor in a state dict to CPU. Non-tensor values pass
+        through unchanged (optimizer step counters, betas, etc.)."""
+        out = {}
+        for k, v in sd.items():
+            if isinstance(v, torch.Tensor):
+                out[k] = v.detach().to("cpu", copy=True, non_blocking=False)
+            elif isinstance(v, dict):
+                out[k] = AsyncCheckpointer._snapshot_state_dict(v)
+            elif isinstance(v, (list, tuple)):
+                snap = [
+                    AsyncCheckpointer._snapshot_state_dict(x) if isinstance(x, dict)
+                    else (x.detach().to("cpu", copy=True) if isinstance(x, torch.Tensor) else x)
+                    for x in v
+                ]
+                out[k] = type(v)(snap)
+            else:
+                out[k] = v
+        return out
+
+    def wait(self):
+        """Block until any pending write finishes; re-raise its error if any."""
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        if self._error is not None:
+            err, self._error = self._error, None
+            raise err
+
+    def save(
+        self,
+        model: nn.Module,
+        optimizer,
+        step: int,
+        checkpoint_path: str,
+        **extra,
+    ):
+        # Backpressure: only one outstanding write at a time.
+        self.wait()
+
+        # Synchronous CPU snapshot — small fraction of total save time.
+        model_sd = self._snapshot_state_dict(model.state_dict())
+        if isinstance(optimizer, (list, tuple)):
+            opt_payload = {
+                "optimizer_state_dicts": [
+                    self._snapshot_state_dict(o.state_dict()) for o in optimizer
+                ]
+            }
+        else:
+            opt_payload = {
+                "optimizer_state_dict": self._snapshot_state_dict(optimizer.state_dict())
+            }
+
+        payload = {"model_state_dict": model_sd, **opt_payload, "step": step}
+        if extra:
+            payload.update(extra)
+
+        def _writer():
+            try:
+                tmp = checkpoint_path + ".tmp"
+                torch.save(payload, tmp)
+                # Atomic rename so a crash mid-write never leaves a corrupt
+                # checkpoint in place of the previous good one.
+                Path(tmp).replace(checkpoint_path)
+                print(f"Checkpoint saved to {checkpoint_path} at step {step}")
+            except BaseException as e:
+                self._error = e
+
+        self._thread = threading.Thread(target=_writer, daemon=True, name="ckpt-writer")
+        self._thread.start()
+
+    def close(self):
+        self.wait()
 
 def load_checkpoint(
     model: nn.Module,
