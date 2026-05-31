@@ -37,7 +37,7 @@ Provide a clear, concise project overview and usage guide that helps a developer
 2. (Optional, one-time) Pre-tokenize FineWeb-Edu to a flat `.bin` so future runs skip in-loader tokenization:
 
    ```bash
-   python simple.py --pretokenize
+   pip install -r requirments.txt
    ```
 
 3. Train (auto-uses `.bin` files if present; otherwise streams + tokenizes on the fly):
@@ -67,3 +67,6 @@ Provide a clear, concise project overview and usage guide that helps a developer
 ## Notes
 
 This README follows the STAR method: Situation, Task, Action, Result.
+Things I want to add in the future:
+1. Flex attention with document masking
+2. A better design for the residual stream

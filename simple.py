@@ -29,6 +29,12 @@ from modules.utils import (
     AsyncCheckpointer,
 )
 
+import torch._inductor.config as ic
+
+ic.triton.cudagraph_trees = True
+ic.coordinate_descent_tuning = True
+ic.coordinate_descent_check_all_directions = True   # slower compile, more thoroughput
+
 # EPYC 9355: 48 cores / 96 threads. Cap PyTorch + MKL thread pools to avoid
 # contention with DataLoader workers (we use 12 workers below).
 os.environ.setdefault("OMP_NUM_THREADS", "8")
@@ -294,9 +300,10 @@ class SimpleTransformerLM(nn.Module):
                 # Top-P (nucleus)
                 if top_p is not None and 0.0 < top_p < 1.0:
                     sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                    cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    softmax_logits = F.softmax(sorted_logits, dim=-1)
+                    cumprobs = torch.cumsum(softmax_logits, dim=-1)
                     # Shift right so the token that pushes cumsum over p is kept
-                    sorted_remove = cumprobs - F.softmax(sorted_logits, dim=-1) >= top_p
+                    sorted_remove = cumprobs - softmax_logits >= top_p
                     remove = sorted_remove.scatter(1, sorted_idx, sorted_remove)
                     logits = logits.masked_fill(remove, float("-inf"))
  
@@ -438,7 +445,26 @@ class StreamingTokenDataset(IterableDataset):
                 # remains a strict 1-shift of x without re-tokenizing.
                 buf = buf[bs:]
 
-def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
+def chunked_cross_entropy(logits, targets, chunk_size=8192):
+    """Cross-entropy that avoids the full-tensor fp32 upcast inside F.cross_entropy.
+
+    F.cross_entropy upcasts the entire (N, V) logits tensor to fp32 for
+    log_softmax. For large B*T*V (e.g. 99*2048*32832), that fp32 copy alone is
+    ~26 GB. Chunking along N caps the upcast at chunk_size * V * 4 bytes.
+    """
+    logits = logits.reshape(-1, logits.size(-1))
+    targets = targets.reshape(-1)
+    n = targets.numel()
+    total = logits.new_zeros((), dtype=torch.float32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        total = total + F.cross_entropy(
+            logits[start:end], targets[start:end], reduction="sum"
+        )
+    return total / n
+
+
+def estimate_loss(model, val_loader, device, eval_iters=20):
     model.eval()
     losses = []
     with torch.no_grad():
@@ -446,7 +472,7 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
             logits, _ = model(xb, use_cache=False)
-            loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+            loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
     
     model.train()
@@ -486,6 +512,7 @@ def main():
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode. max-autotune is best for Blackwell long runs "
                              "but adds ~5-10 min warmup on the first step.")
+    parser.add_argument("--eval-interval", type=int, default=999)
  
     # Generation
     parser.add_argument("--temperature",    type=float, default=0.8)
@@ -583,11 +610,11 @@ def main():
         val_data = precompute_val_tokens(tokenizer, eot_id)
         val_dataset = TokenDataset(val_data, block_size)
 
-    # EPYC 9355: 48C/96T — 12 workers per loader leaves headroom for the main
+    # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
     # process and the OS without causing core contention. Each train worker
     # streams its own shard of FineWeb-Edu so they don't replay docs.
     loader_kwargs = dict(
-        num_workers=12,
+        num_workers=2,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=4,
@@ -663,7 +690,7 @@ def main():
     )
 
     max_steps     = args.max_steps
-    eval_interval = 99
+    eval_interval = args.eval_interval
     warmup_steps  = min(99, max(0, max_steps - 1))
 
     def get_lr(step):
@@ -709,7 +736,7 @@ def main():
 
         with autocast_ctx:
             logits, _ = model(xb, use_cache=False)
-            loss = F.cross_entropy(logits.view(-1, model.vocab_size), yb.view(-1))
+            loss = chunked_cross_entropy(logits, yb)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -717,12 +744,14 @@ def main():
             opt.step()
 
         if step % eval_interval == 0:
-            val_loss  = estimate_loss(model, val_loader, model.vocab_size, device)
-            vram_used = torch.cuda.memory_reserved() / 1e9 if device == "cuda" else 0.0
+            val_loss  = estimate_loss(model, val_loader, device)
+            peak_alloc = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
+            peak_reserved = torch.cuda.max_memory_reserved() / 1e9 if device == "cuda" else 0.0
+            if device == "cuda": torch.cuda.reset_peak_memory_stats()
             print(
                 f"step {step:04d} | lr {lr:.2e} | "
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
-                f"VRAM {vram_used:.1f}GB"
+                f"peak active {peak_alloc:.1f}GB | peak reserved {peak_reserved:.1f}GB"
             )
             ckpt_writer.save(model, optimizers, step, args.checkpoint)
 
@@ -737,38 +766,16 @@ def main():
     # -------------------------------------------------------------------------
     print("\n--- Generating Sample Text ---\n")
     context = torch.tensor([encode(args.prompt)], device=device)
- 
-    # Check if the user passed any explicit sampling flags
-    user_specified_sampling = (
-        args.top_k is not None or
-        args.top_p is not None or
-        args.min_p != 0.05 or
-        args.repetition_penalty != 1.0  # non-default means user set it explicitly
-    )
- 
-    if args.no_sweep or user_specified_sampling:
-        configs = {
-            "custom": dict(
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                min_p=args.min_p,
-                repetition_penalty=args.repetition_penalty,
-            )
-        }
-    else:
-        # Default: comparison sweep so you can see sampler differences at a glance.
-        print("Default temperature is 0.8")
 
-        configs = {
-            "top_k=40":                dict(temperature=0.8, top_k=40,   top_p=None, min_p=None, repetition_penalty=1.1),
-            "top_p=0.9":               dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=None, repetition_penalty=1.1),
-            "min_p=0.05":              dict(temperature=0.8, top_k=None, top_p=None, min_p=0.05, repetition_penalty=1.1),
-            "top_p=0.9 + min_p=0.05":  dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=0.05, repetition_penalty=1.1),
-            "RepPenalty=1.2":          dict(temperature=0.8, top_k=None, top_p=None, min_p=None, repetition_penalty=1.2),
-            "Temp=0.5":                dict(temperature=0.5, top_k=None, top_p=None, min_p=None, repetition_penalty=1.1),
-            "Temp=1.5":                dict(temperature=1.5, top_k=None, top_p=None, min_p=None, repetition_penalty=1.1),
-        }
+    configs = {
+        "top_k=40":                dict(temperature=0.8, top_k=40,   top_p=None, min_p=None, repetition_penalty=1.1),
+        "top_p=0.9":               dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=None, repetition_penalty=1.1),
+        "min_p=0.05":              dict(temperature=0.8, top_k=None, top_p=None, min_p=0.05, repetition_penalty=1.1),
+        "top_p=0.9 + min_p=0.05":  dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=0.05, repetition_penalty=1.1),
+        "RepPenalty=1.2":          dict(temperature=0.8, top_k=None, top_p=None, min_p=None, repetition_penalty=1.2),
+        "Temp=0.5":                dict(temperature=0.5, top_k=None, top_p=None, min_p=None, repetition_penalty=1.1),
+        "Temp=1.5":                dict(temperature=1.5, top_k=None, top_p=None, min_p=None, repetition_penalty=1.1),
+    }
  
     for label, cfg in configs.items():
         print(f"[{label}]")
