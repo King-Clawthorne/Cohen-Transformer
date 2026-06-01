@@ -2,6 +2,8 @@ import os
 import math
 import random
 import argparse
+import copy
+import threading
 
 import torch
 import torch.nn as nn
@@ -440,6 +442,7 @@ def main():
     parser.add_argument("--compile-mode", type=str,   default="max-autotune",
                         choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--eval-interval", type=int, default=999)
+    parser.add_argument("--grad-accum",   type=int, default=1)
  
     args = parser.parse_args()
  
@@ -572,6 +575,25 @@ def main():
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
         return 0.1 * LR_PEAK + 0.5 * (LR_PEAK - 0.1 * LR_PEAK) * (1 + math.cos(math.pi * progress))
 
+    # Async checkpoint: snapshot state dicts on the main thread, write to disk
+    # in a background thread so the training loop isn't blocked by I/O.
+    _ckpt_thread: threading.Thread | None = None
+
+    def save_checkpoint_async(model, optimizers, step, path):
+        nonlocal _ckpt_thread
+        if _ckpt_thread is not None and _ckpt_thread.is_alive():
+            _ckpt_thread.join()
+        snapshot = {
+            "model_state_dict": copy.deepcopy(model.state_dict()),
+            "optimizer_state_dicts": [copy.deepcopy(o.state_dict()) for o in optimizers],
+            "step": step,
+        }
+        def _write():
+            torch.save(snapshot, path)
+            print(f"Checkpoint saved to {path} at step {step}")
+        _ckpt_thread = threading.Thread(target=_write, daemon=True)
+        _ckpt_thread.start()
+
     step       = 0
     train_iter = iter(train_loader)
     train_block_mask = make_block_mask(block_size, args.batch_size, device)
@@ -606,11 +628,24 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        with autocast_ctx:
-            logits, _ = model(xb, use_cache=False, block_mask=train_block_mask)
-            loss = chunked_cross_entropy(logits, yb)
+        loss = None
+        for micro_step in range(args.grad_accum):
+            if micro_step > 0:
+                try:
+                    xb, yb = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    xb, yb = next(train_iter)
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
 
-        loss.backward()
+            with autocast_ctx:
+                logits, _ = model(xb, use_cache=False, block_mask=train_block_mask)
+                micro_loss = chunked_cross_entropy(logits, yb) / args.grad_accum
+
+            micro_loss.backward()
+            loss = micro_loss if loss is None else loss + micro_loss
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
@@ -625,9 +660,12 @@ def main():
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
                 f"peak active {peak_alloc:.1f}GB | peak reserved {peak_reserved:.1f}GB"
             )
-            save_checkpoint(model, optimizers, step, args.checkpoint)
+            save_checkpoint_async(model, optimizers, step, args.checkpoint)
 
         step += 1
+
+    if _ckpt_thread is not None:
+        _ckpt_thread.join()
 
     # -------------------------------------------------------------------------
     # Generation
