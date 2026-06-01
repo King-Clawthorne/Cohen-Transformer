@@ -2,14 +2,19 @@ import os
 import math
 import random
 import argparse
-
+import copy
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
-from torch.optim import Muon
+from modules.muon import Muon
+
+from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
 from modules.utils import (
@@ -28,6 +33,7 @@ ic.coordinate_descent_check_all_directions = True   # slower compile, more thoro
 # contention with DataLoader workers (we use 12 workers below).
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 os.environ.setdefault("MKL_NUM_THREADS", "8")
+
  
 # Blackwell: expandable segments reduce fragmentation over long runs
 # with large KV caches and variable-length allocations.
@@ -97,6 +103,7 @@ class SimpleTransformerLM(nn.Module):
             nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
         ])
  
+
         self.ln_f = RMSNorm(n_embd)
 
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
@@ -121,7 +128,7 @@ class SimpleTransformerLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, past_kvs=None, use_cache=False):
+    def forward(self, idx, past_kvs=None, use_cache=False, block_mask=None):
         bsz, seq_len = idx.shape
         if seq_len > self.block_size:
             raise ValueError("Sequence length exceeds block_size")
@@ -138,8 +145,7 @@ class SimpleTransformerLM(nn.Module):
             v = v.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             offset = past_kvs[layer][0].size(2) if past_kvs is not None else 0
             cos, sin = self.rope(q.size(2), offset=offset)
-            q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
+            q, k = apply_rope(q, k, cos, sin)
 
             past_len = 0
             if past_kvs is not None:
@@ -153,38 +159,24 @@ class SimpleTransformerLM(nn.Module):
             # `score * gain[h]` but expressed as a plain tensor op SDPA can fuse.
             q = q * self.qk_gain[layer].view(1, self.n_heads, 1, 1).to(q.dtype)
 
-            attn_mask = None
-            is_causal = True
             if past_len > 0:
-                # KV-cache decode: q positions are offset by past_len, so the
-                # plain causal flag (which assumes aligned q/k) is wrong. Build
-                # an explicit lower-right causal mask over the full key range.
+                # KV-cache decode: flex_attention doesn't support cross-length
+                # q/k easily, so fall back to SDPA with an explicit causal mask.
                 total_len = past_len + seq_len
                 query_positions = past_len + torch.arange(seq_len, device=q.device)
                 key_positions = torch.arange(total_len, device=q.device)
                 attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-                is_causal = False
-
-            # cuDNN's fused attention is the fastest SDPA backend on Blackwell
-            # for these shapes; prioritize it so torch.compile doesn't pick a
-            # slower path. set_priority keeps the others as ordered fallbacks if
-            # cuDNN rejects a given shape/mask (e.g. the masked decode step).
-            with sdpa_kernel(
-                [
-                    SDPBackend.CUDNN_ATTENTION,
-                    SDPBackend.FLASH_ATTENTION,
-                    SDPBackend.EFFICIENT_ATTENTION,
-                    SDPBackend.MATH,
-                ],
-                set_priority=True,
-            ):
-                y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=0.0,
-                    is_causal=is_causal,
-                    scale=self.scale,
-                )
+                with sdpa_kernel(
+                    [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                     SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+                    set_priority=True,
+                ):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, dropout_p=0.0,
+                        is_causal=False, scale=self.scale,
+                    )
+            else:
+                y = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
 
             y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
             y = self.proj[layer](y)
@@ -193,7 +185,7 @@ class SimpleTransformerLM(nn.Module):
             x_norm = self.ln2[layer](x)
             up = self.w_up[layer](x_norm)
             gate = self.w_gate[layer](x_norm)
-            mlp_out = self.w_down[layer](F.silu(gate) * up)
+            mlp_out = self.w_down[layer](LigerSiLUMulFunction.apply(gate, up))
             x = residual + self.ls_mlp[layer] * mlp_out
             if use_cache: new_kvs.append((k, v))
 
@@ -390,23 +382,26 @@ class StreamingTokenDataset(IterableDataset):
                 # remains a strict 1-shift of x without re-tokenizing.
                 buf = buf[bs:]
 
-def chunked_cross_entropy(logits, targets, chunk_size=8192):
-    """Cross-entropy that avoids the full-tensor fp32 upcast inside F.cross_entropy.
 
-    F.cross_entropy upcasts the entire (N, V) logits tensor to fp32 for
-    log_softmax. For large B*T*V (e.g. 99*2048*32832), that fp32 copy alone is
-    ~26 GB. Chunking along N caps the upcast at chunk_size * V * 4 bytes.
-    """
-    logits = logits.reshape(-1, logits.size(-1))
-    targets = targets.reshape(-1)
-    n = targets.numel()
-    total = logits.new_zeros((), dtype=torch.float32)
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        total = total + F.cross_entropy(
-            logits[start:end], targets[start:end], reduction="sum"
-        )
-    return total / n
+_liger_ce = LigerCrossEntropyLoss()
+
+def chunked_cross_entropy(logits, targets):
+    return _liger_ce(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+
+_compiled_create_block_mask = torch.compile(create_block_mask)
+
+def make_block_mask(seq_len, batch_size, device, doc_ids=None):
+    if doc_ids is not None:
+        _doc = doc_ids
+        def _mask(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (_doc[b, q_idx] == _doc[b, kv_idx])
+    else:
+        def _mask(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+    return _compiled_create_block_mask(
+        _mask, B=batch_size, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
+    )
 
 
 def estimate_loss(model, val_loader, device, eval_iters=20):
@@ -416,10 +411,11 @@ def estimate_loss(model, val_loader, device, eval_iters=20):
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            logits, _ = model(xb, use_cache=False)
+            block_mask = make_block_mask(xb.size(1), xb.size(0), device)
+            logits, _ = model(xb, use_cache=False, block_mask=block_mask)
             loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
-    
+
     model.train()
     return sum(losses) / len(losses) if losses else 0.0
 
@@ -437,7 +433,8 @@ def main():
     parser.add_argument("--compile-mode", type=str,   default="max-autotune",
                         choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--eval-interval", type=int, default=999)
- 
+    parser.add_argument("--grad-accum",   type=int, default=1)
+
     args = parser.parse_args()
  
     torch.manual_seed(0)
@@ -477,7 +474,6 @@ def main():
     train_dataset = StreamingTokenDataset(
         tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
     )
-
     val_data = precompute_val_tokens(tokenizer, eot_id)
     val_dataset = TokenDataset(val_data, block_size)
 
@@ -518,10 +514,12 @@ def main():
     # Drop fullgraph=True if modules.layers has graph breaks.
     model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
-    # Hybrid optimizer: Muon for 2D body matrices, AdamW for embeddings,
-    # lm_head (tied to token_emb), RMSNorm gains, and LayerScale parameters.
-    # Muon's orthogonalization is only well-defined on matrix-shaped weights.
-    muon_params, adamw_params = [], []
+    # Hybrid optimizer: Muon for 2D body matrices, AdamW for everything else.
+    # AdamW params are split into two groups: 1D/embedding tensors (norms,
+    # LayerScale, QK-gain, embeddings) get weight_decay=0 because decaying
+    # scale parameters fights normalization and decaying embeddings harms rare
+    # tokens. Only the 2D body matrices warrant decay, and those go to Muon.
+    muon_params, adamw_wd_params, adamw_no_wd_params = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -530,7 +528,12 @@ def main():
             and "token_emb" not in name
             and "lm_head" not in name
         )
-        (muon_params if is_body_matrix else adamw_params).append(p)
+        if is_body_matrix:
+            muon_params.append(p)
+        elif p.ndim >= 2:  # embedding matrix (token_emb / lm_head, tied)
+            adamw_wd_params.append(p)
+        else:              # 1D: norm weights, LayerScale, QK-gain
+            adamw_no_wd_params.append(p)
 
     LR_PEAK = 1e-3
 
@@ -545,17 +548,20 @@ def main():
         adjust_lr_fn="match_rms_adamw",
     )
     adamw_opt = torch.optim.AdamW(
-        adamw_params,
+        [
+            {"params": adamw_wd_params,    "weight_decay": 0.1},
+            {"params": adamw_no_wd_params, "weight_decay": 0.0},
+        ],
         lr=LR_PEAK,
         betas=(0.9, 0.99),
-        weight_decay=0.1,
         fused=(device == "cuda"),
     )
     optimizers = [muon_opt, adamw_opt]
 
     print(
-        f"Optimizer split: Muon on {len(muon_params)} matrices, "
-        f"AdamW on {len(adamw_params)} tensors."
+        f"Optimizer split: Muon on {len(muon_params)} matrices "
+        f"(wd=0.1), AdamW on {len(adamw_wd_params)} embedding tensors "
+        f"(wd=0.1) + {len(adamw_no_wd_params)} 1D tensors (wd=0)."
     )
 
     max_steps     = args.max_steps
@@ -569,8 +575,28 @@ def main():
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
         return 0.1 * LR_PEAK + 0.5 * (LR_PEAK - 0.1 * LR_PEAK) * (1 + math.cos(math.pi * progress))
 
+    # Async checkpoint: snapshot state dicts on the main thread, write to disk
+    # in a background thread so the training loop isn't blocked by I/O.
+    _ckpt_thread: threading.Thread | None = None
+
+    def save_checkpoint_async(model, optimizers, step, path):
+        nonlocal _ckpt_thread
+        if _ckpt_thread is not None and _ckpt_thread.is_alive():
+            _ckpt_thread.join()
+        snapshot = {
+            "model_state_dict": copy.deepcopy(model.state_dict()),
+            "optimizer_state_dicts": [copy.deepcopy(o.state_dict()) for o in optimizers],
+            "step": step,
+        }
+        def _write():
+            torch.save(snapshot, path)
+            print(f"Checkpoint saved to {path} at step {step}")
+        _ckpt_thread = threading.Thread(target=_write, daemon=True)
+        _ckpt_thread.start()
+
     step       = 0
     train_iter = iter(train_loader)
+    train_block_mask = make_block_mask(block_size, args.batch_size, device)
 
     if args.resume:
         loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
@@ -602,11 +628,24 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        with autocast_ctx:
-            logits, _ = model(xb, use_cache=False)
-            loss = chunked_cross_entropy(logits, yb)
+        loss = None
+        for micro_step in range(args.grad_accum):
+            if micro_step > 0:
+                try:
+                    xb, yb = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    xb, yb = next(train_iter)
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
 
-        loss.backward()
+            with autocast_ctx:
+                logits, _ = model(xb, use_cache=False, block_mask=train_block_mask)
+                micro_loss = chunked_cross_entropy(logits, yb) / args.grad_accum
+
+            micro_loss.backward()
+            loss = micro_loss if loss is None else loss + micro_loss
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
@@ -621,9 +660,12 @@ def main():
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
                 f"peak active {peak_alloc:.1f}GB | peak reserved {peak_reserved:.1f}GB"
             )
-            save_checkpoint(model, optimizers, step, args.checkpoint)
+            save_checkpoint_async(model, optimizers, step, args.checkpoint)
 
         step += 1
+
+    if _ckpt_thread is not None:
+        _ckpt_thread.join()
 
     # -------------------------------------------------------------------------
     # Generation
