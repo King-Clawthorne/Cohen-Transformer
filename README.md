@@ -24,33 +24,19 @@ Provide a clear, concise project overview and usage guide that helps a developer
 
 ## Quick Start
 
-1. Install dependencies (PyTorch nightly recommended for Blackwell / cuDNN SDPA; `torchao` only needed for `--fp8`):
-
-   ```bash
-   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
-   pip install datasets tokenizers
-   pip install torchao  # optional, for --fp8
-   ```
-
-2. (Optional, one-time) Pre-tokenize FineWeb-Edu to a flat `.bin` so future runs skip in-loader tokenization:
+1. Install dependencies:
 
    ```bash
    pip install -r requirments.txt
    ```
 
-3. Train (auto-uses `.bin` files if present; otherwise streams + tokenizes on the fly):
+2. Train:
 
    ```bash
    python simple.py --max-steps 9999 --batch-size 99 --block-size 2048
    ```
 
-4. Train with FP8 body matmuls on Blackwell (~1.5–1.8× step-time speedup):
-
-   ```bash
-   python simple.py --fp8 --max-steps 9999 --batch-size 192 --block-size 2048
-   ```
-
-5. Resume from a checkpoint and skip straight to generation:
+3. Resume from a checkpoint and skip straight to generation:
 
    ```bash
    python simple.py --resume --max-steps 0 --prompt "The capital of France"
