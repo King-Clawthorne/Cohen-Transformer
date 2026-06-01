@@ -12,21 +12,19 @@ Provide a clear, concise project overview and usage guide that helps a developer
 
 - Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py` with multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE), LayerScale residual gating, QK-gain, logit softcap, weight-tied embeddings/lm_head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers.
 - Switched the optimizer to `torch.optim.Muon` for the body's 2D weight matrices (Newton-Schulz–orthogonalized momentum with the Moonshot `match_rms_adamw` LR adjustment) paired with AdamW for embeddings, RMSNorm gains, and LayerScale vectors.
-- Swapped training data from TinyStories to a streaming `HuggingFaceFW/fineweb-edu` `sample-10BT` pipeline: per-worker shard splitting on an `IterableDataset`, a pre-tokenized held-out val set, and a 32k custom BPE trained on a 50k-doc sample.
-- Added an offline pre-tokenization mode (`--pretokenize`) that writes a flat uint16 `.bin` plus sidecar metadata, and a `MemmapTokenDataset` that mmaps it across DataLoader workers — eliminates the in-loader tokenization bottleneck for repeat runs.
-- Migrated the training attention path to `torch.nn.attention.flex_attention` with a cached causal `BlockMask` and QK-gain folded into the `score_mod` closure, so mask + per-head gain fuse into one Triton kernel. KV-cache decode stays on SDPA (q_len=1, BlockMask rebuild would dominate).
-- Added `AsyncCheckpointer`: snapshots model + optimizer state to CPU synchronously, then `torch.save`s on a background thread with atomic temp-file rename. At most one outstanding write at a time so a slow disk applies backpressure instead of piling snapshots in RAM.
-- Centralized tokenizer training, (multi-optimizer) checkpointing, async checkpointing, and the pre-tokenization writer in `modules/utils.py`; core building blocks (`RMSNorm`, `RotaryEmbedding`, `apply_rope`) in `modules/layers.py`.
+- Swapped training data from TinyStories to a streaming `HuggingFaceFW/fineweb-edu` `sample-10BT` pipeline: per-worker shard splitting on an `IterableDataset`, an on-the-fly tokenized held-out val set, and a 32k custom BPE trained on a 50k-doc sample.
+- Runs attention through `F.scaled_dot_product_attention` with the cuDNN fused backend prioritized via `sdpa_kernel(..., set_priority=True)`, folding the learnable per-head QK-gain into `q` so it scales the score before softmax. Training/prefill uses the fast causal flag; KV-cache decode swaps in an explicit lower-right causal mask.
+- Centralized tokenizer training and (multi-optimizer) checkpoint save/load in `modules/utils.py`; core building blocks (`RMSNorm`, `RotaryEmbedding`, `apply_rope`) in `modules/layers.py`.
 
 ## Result
 
-- A self-contained training script that reads top-to-bottom, runs on a single Blackwell-class GPU, and reaches modern recipe parity (Muon + FineWeb-Edu + BF16/FP8 + `torch.compile` + flex_attention + async checkpoints) without any framework on top of PyTorch.
-- Tokenizer cache, multi-optimizer checkpoint format, streaming + mmap datasets, and an FP8 + flex_attention–friendly model definition all reusable for further experiments.
+- A self-contained training script that reads top-to-bottom, runs on a single Blackwell-class GPU, and reaches modern recipe parity (Muon + FineWeb-Edu + BF16/FP8 + `torch.compile` + cuDNN SDPA) without any framework on top of PyTorch.
+- Tokenizer cache, multi-optimizer checkpoint format, streaming dataset, and an FP8-friendly model definition all reusable for further experiments.
 - Solid foundation for trying architectural variants (GQA, deeper stacks, alternative residual schemes) against a known-good baseline.
 
 ## Quick Start
 
-1. Install dependencies (PyTorch nightly recommended for Blackwell / flex_attention; `torchao` only needed for `--fp8`):
+1. Install dependencies (PyTorch nightly recommended for Blackwell / cuDNN SDPA; `torchao` only needed for `--fp8`):
 
    ```bash
    pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
@@ -60,9 +58,9 @@ Provide a clear, concise project overview and usage guide that helps a developer
 
 ## Files
 
-- `simple.py` — model, training loop, FineWeb-Edu streaming dataset, memmap dataset, pre-tokenization CLI, FP8 wiring, flex_attention path, and generation
+- `simple.py` — model, training loop, FineWeb-Edu streaming dataset, FP8 wiring, cuDNN SDPA path, and generation
 - `modules/layers.py` — `RMSNorm`, `RotaryEmbedding`, `apply_rope`
-- `modules/utils.py` — BPE training/loading, sync + async checkpoint save/load (single or list of optimizers), `pretokenize_to_bin` writer, dataset helpers
+- `modules/utils.py` — BPE training/loading, checkpoint save/load (single or list of optimizers), dataset helpers
 
 ## Things I want to add in the future:
 1. Flex attention with document masking

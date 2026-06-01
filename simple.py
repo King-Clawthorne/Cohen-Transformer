@@ -3,30 +3,19 @@ import math
 import random
 import argparse
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
-
-# flex_attention only reaches its perf ceiling under torch.compile — the Python
-# eager path is a reference impl. We compile once here and reuse for every layer.
-_flex_attention = torch.compile(flex_attention, dynamic=False)
-
-
-def _causal_mask_mod(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
 
 from torch.optim import Muon
 
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
 from modules.utils import (
     load_checkpoint,
+    save_checkpoint,
     train_or_load_bpe,
-    pretokenize_to_bin,
-    load_pretokenized_meta,
-    AsyncCheckpointer,
 )
 
 import torch._inductor.config as ic
@@ -98,12 +87,6 @@ class SimpleTransformerLM(nn.Module):
 
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=block_size)
 
-        # BlockMask construction is expensive (~ms) and shape-dependent. The
-        # training path always uses the full square (block_size, block_size)
-        # causal mask, so build it once and reuse for every step.
-        self._cached_block_mask = None
-        self._cached_block_mask_len = None
-     
         # LayerScale (CaiT, Touvron et al. 2021) — learnable per-channel residual gates.
         # Init to 0.1 for a ~100M-class model; use 1e-4 for deeper stacks (>24 layers).
         _ls_init = 0.1
@@ -131,19 +114,6 @@ class SimpleTransformerLM(nn.Module):
                 mean=0.0,
                 std=0.02 / math.sqrt(2 * n_layers),
             )
-
-    def _get_block_mask(self, seq_len, device):
-        """Lazily build and cache a square causal BlockMask. Rebuilds only
-        when `seq_len` changes (e.g. a different `block_size` between runs)."""
-        if self._cached_block_mask_len != seq_len or self._cached_block_mask is None:
-            self._cached_block_mask = create_block_mask(
-                _causal_mask_mod,
-                B=None, H=None,
-                Q_LEN=seq_len, KV_LEN=seq_len,
-                device=device,
-            )
-            self._cached_block_mask_len = seq_len
-        return self._cached_block_mask
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -178,38 +148,36 @@ class SimpleTransformerLM(nn.Module):
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
 
-            if past_len == 0 and not use_cache:
-                # Training / prefill path: flex_attention with QK-gain folded
-                # into score_mod. The Triton kernel fuses mask + per-head gain
-                # so we save the explicit `q * gain` materialization and an
-                # extra read of q from HBM.
-                gain = self.qk_gain[layer]
+            # QK-gain: fold the learnable per-head gain into q so it scales the
+            # q·k score before softmax — equivalent to the old score_mod's
+            # `score * gain[h]` but expressed as a plain tensor op SDPA can fuse.
+            q = q * self.qk_gain[layer].view(1, self.n_heads, 1, 1).to(q.dtype)
 
-                def score_mod(score, b, h, q_idx, kv_idx, gain=gain):
-                    return score * gain[h]
+            attn_mask = None
+            is_causal = True
+            if past_len > 0:
+                # KV-cache decode: q positions are offset by past_len, so the
+                # plain causal flag (which assumes aligned q/k) is wrong. Build
+                # an explicit lower-right causal mask over the full key range.
+                total_len = past_len + seq_len
+                query_positions = past_len + torch.arange(seq_len, device=q.device)
+                key_positions = torch.arange(total_len, device=q.device)
+                attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                is_causal = False
 
-                block_mask = self._get_block_mask(seq_len, q.device)
-                y = _flex_attention(
-                    q, k, v,
-                    score_mod=score_mod,
-                    block_mask=block_mask,
-                    scale=self.scale,
-                )
-            else:
-                # KV-cache decode path: q_len is typically 1, so attention is
-                # small and BlockMask rebuild cost per step would dominate.
-                # Stay on SDPA with the lower-right causal mask.
-                q = q * self.qk_gain[layer].view(1, self.n_heads, 1, 1).to(q.dtype)
-
-                attn_mask = None
-                is_causal = True
-                if past_len > 0:
-                    total_len = past_len + seq_len
-                    query_positions = past_len + torch.arange(seq_len, device=q.device)
-                    key_positions = torch.arange(total_len, device=q.device)
-                    attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-                    is_causal = False
-
+            # cuDNN's fused attention is the fastest SDPA backend on Blackwell
+            # for these shapes; prioritize it so torch.compile doesn't pick a
+            # slower path. set_priority keeps the others as ordered fallbacks if
+            # cuDNN rejects a given shape/mask (e.g. the masked decode step).
+            with sdpa_kernel(
+                [
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ],
+                set_priority=True,
+            ):
                 y = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=attn_mask,
@@ -321,29 +289,6 @@ class SimpleTransformerLM(nn.Module):
         finally:
             if was_training:
                 self.train()
-
-class MemmapTokenDataset(Dataset):
-    """Reads a flat token-id binary written by `pretokenize_to_bin` via numpy
-    memmap, so dozens of DataLoader workers share one OS-level page cache
-    instead of each loading the file. Yields non-overlapping (x, y) windows
-    of `block_size` for next-token prediction.
-    """
-
-    def __init__(self, bin_path: str, block_size: int):
-        meta = load_pretokenized_meta(bin_path)
-        self.dtype = np.dtype(meta["dtype"])
-        self.data = np.memmap(bin_path, dtype=self.dtype, mode="r")
-        self.block_size = block_size
-
-    def __len__(self):
-        return max(0, len(self.data) - self.block_size - 1)
-
-    def __getitem__(self, idx):
-        chunk = np.asarray(self.data[idx : idx + self.block_size + 1], dtype=np.int64)
-        x = torch.from_numpy(chunk[:-1])
-        y = torch.from_numpy(chunk[1:])
-        return x, y
-
 
 class TokenDataset(Dataset):
     def __init__(self, token_ids, block_size):
@@ -483,52 +428,15 @@ def main():
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
-    parser.add_argument("--batch-size",   type=int,   default=99,
-                        help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
+    parser.add_argument("--batch-size",   type=int,   default=99)
     parser.add_argument("--block-size",   type=int,   default=2048)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
-    parser.add_argument("--resume",       action="store_true",
-                        help="Resume training from --checkpoint before running any new steps.")
-    parser.add_argument("--vocab-size",     type=int, default=32768,
-                        help="Custom BPE vocab size. 32k suits general English web text; "
-                             "8k was fine for TinyStories but starves a model on FineWeb-Edu.")
-    parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json",
-                        help="Path to cache the trained BPE tokenizer.")
-    # Pre-tokenization (one-time): stream FineWeb-Edu, encode in batches, and
-    # write a flat uint16 .bin readable by MemmapTokenDataset. Skips the
-    # tokenize-in-DataLoader hot path entirely.
-    parser.add_argument("--pretokenize", action="store_true",
-                        help="Run pre-tokenization to --train-bin/--val-bin and exit.")
-    parser.add_argument("--train-bin",   type=str, default="fineweb_edu_train.bin",
-                        help="Path to pre-tokenized train token .bin (used if it exists).")
-    parser.add_argument("--val-bin",     type=str, default="fineweb_edu_val.bin",
-                        help="Path to pre-tokenized val token .bin (used if it exists).")
-    parser.add_argument("--pretokenize-train-tokens", type=int, default=1_000_000_000,
-                        help="Cap on training tokens to write (default 1B). None = full 10B sample.")
-    parser.add_argument("--pretokenize-train-docs",   type=int, default=None,
-                        help="Optional doc cap; whichever of docs/tokens hits first stops the writer.")
-    
+    parser.add_argument("--resume",       action="store_true")
+    parser.add_argument("--vocab-size",     type=int, default=32768)
+    parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json")
     parser.add_argument("--compile-mode", type=str,   default="max-autotune",
-                        choices=["default", "reduce-overhead", "max-autotune"],
-                        help="torch.compile mode. max-autotune is best for Blackwell long runs "
-                             "but adds ~5-10 min warmup on the first step.")
+                        choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--eval-interval", type=int, default=999)
- 
-    # Generation
-    parser.add_argument("--temperature",    type=float, default=0.8)
-    parser.add_argument("--top-k",          type=int,   default=None)
-    parser.add_argument("--top-p",          type=float, default=None,
-                        help="Nucleus sampling threshold, e.g. 0.9")
-    parser.add_argument("--min-p",          type=float, default=0.05,
-                        help="Min-P threshold. Good default: 0.05-0.10. "
-                             "Best lever against repetition loops.")
-    parser.add_argument("--repetition-penalty", type=float, default=1.0,
-                        help="Downweight previously generated tokens. Good starting range: 1.05-1.20.")
-    parser.add_argument("--max-new-tokens", type=int,   default=200)
-    parser.add_argument("--prompt",         type=str,   default="Once upon a time",
-                        help="Generation prompt. TinyStories-style prompts work best.")
-    parser.add_argument("--no-sweep",       action="store_true",
-                        help="Skip the sampler comparison sweep and only run --prompt once.")
  
     args = parser.parse_args()
  
@@ -564,51 +472,14 @@ def main():
     encode = lambda s: tokenizer.encode(s).ids
     decode = lambda ids: tokenizer.decode(ids)
 
-    # -------------------------------------------------------------------------
-    # Pre-tokenization mode: write .bin files then exit. Train + val are kept
-    # disjoint by reusing the existing VAL_DOCS skip convention.
-    # -------------------------------------------------------------------------
-    if args.pretokenize:
-        def train_docs():
-            cap = args.pretokenize_train_docs
-            for ex in fineweb_edu_stream(skip=VAL_DOCS, take=cap):
-                yield ex["text"]
-
-        def val_docs():
-            for ex in fineweb_edu_stream(take=VAL_DOCS):
-                yield ex["text"]
-
-        print(f"Pre-tokenizing validation set -> {args.val_bin}")
-        pretokenize_to_bin(val_docs(), tokenizer, eot_id, args.val_bin)
-        print(f"Pre-tokenizing training set -> {args.train_bin}")
-        pretokenize_to_bin(
-            train_docs(), tokenizer, eot_id, args.train_bin,
-            max_tokens=args.pretokenize_train_tokens,
-        )
-        print("Pre-tokenization complete.")
-        return
-
     block_size = args.block_size
 
-    # Prefer pre-tokenized .bin files when available — much faster steady-state
-    # throughput than tokenizing in the DataLoader workers.
-    train_bin_exists = os.path.exists(args.train_bin) and os.path.exists(args.train_bin + ".json")
-    val_bin_exists   = os.path.exists(args.val_bin)   and os.path.exists(args.val_bin   + ".json")
+    train_dataset = StreamingTokenDataset(
+        tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
+    )
 
-    if train_bin_exists:
-        print(f"Using pre-tokenized train set: {args.train_bin}")
-        train_dataset = MemmapTokenDataset(args.train_bin, block_size)
-    else:
-        train_dataset = StreamingTokenDataset(
-            tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
-        )
-
-    if val_bin_exists:
-        print(f"Using pre-tokenized val set: {args.val_bin}")
-        val_dataset = MemmapTokenDataset(args.val_bin, block_size)
-    else:
-        val_data = precompute_val_tokens(tokenizer, eot_id)
-        val_dataset = TokenDataset(val_data, block_size)
+    val_data = precompute_val_tokens(tokenizer, eot_id)
+    val_dataset = TokenDataset(val_data, block_size)
 
     # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
     # process and the OS without causing core contention. Each train worker
@@ -623,11 +494,9 @@ def main():
 
     # IterableDataset can't be shuffled by the loader — FineWeb-Edu's row order
     # is already arbitrary across shards, so this is fine for pretraining.
-    # Map-style memmap dataset *should* be shuffled so consecutive batches
-    # aren't from the same FineWeb shard.
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        shuffle=isinstance(train_dataset, MemmapTokenDataset),
+        shuffle=False,
         **loader_kwargs,
     )
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, **loader_kwargs)
@@ -702,7 +571,6 @@ def main():
 
     step       = 0
     train_iter = iter(train_loader)
-    ckpt_writer = AsyncCheckpointer()
 
     if args.resume:
         loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
@@ -753,13 +621,9 @@ def main():
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
                 f"peak active {peak_alloc:.1f}GB | peak reserved {peak_reserved:.1f}GB"
             )
-            ckpt_writer.save(model, optimizers, step, args.checkpoint)
+            save_checkpoint(model, optimizers, step, args.checkpoint)
 
         step += 1
-
-    # Flush the final pending save before generation/exit so the on-disk
-    # checkpoint reflects the last training state.
-    ckpt_writer.close()
 
     # -------------------------------------------------------------------------
     # Generation
