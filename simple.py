@@ -42,38 +42,6 @@ os.environ.setdefault(
     "expandable_segments:True,max_split_size_mb:512",
 )
 
-class HyperConnection(nn.Module):
-    """
-    Hyper-connection residual (arXiv 2409.19606).
-
-    Maintains `expansion_rate` parallel hidden streams per position.
-    Replaces both the residual add and LayerScale with learned stream mixing:
-      - alpha_in  (n,)   : softmax weights to combine n streams into sublayer input
-      - alpha_out (n, n) : how n streams mix after the sublayer (init: identity)
-      - beta      (n,)   : how much the sublayer output updates each stream (init: e_0)
-    """
-
-    def __init__(self, expansion_rate: int):
-        super().__init__()
-        n = expansion_rate
-        self.n = n
-        self.alpha_in = nn.Parameter(torch.zeros(n))
-        self.alpha_out = nn.Parameter(torch.eye(n))
-        beta_init = torch.zeros(n)
-        beta_init[0] = 1.0
-        self.beta = nn.Parameter(beta_init)
-
-    def get_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Weighted sum of n streams -> single stream for the sublayer. (B,T,n,d)->(B,T,d)"""
-        w = F.softmax(self.alpha_in, dim=0)
-        return (x * w.view(1, 1, -1, 1)).sum(2)
-
-    def update(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Mix existing streams and add scaled sublayer output. (B,T,n,d),(B,T,d)->(B,T,n,d)"""
-        x_mixed = torch.einsum("ij,btjd->btid", self.alpha_out, x)
-        return x_mixed + self.beta.view(1, 1, -1, 1) * y.unsqueeze(2)
-
-
 class SimpleTransformerLM(nn.Module):
     def __init__(
         self,
@@ -83,7 +51,6 @@ class SimpleTransformerLM(nn.Module):
         n_heads=12,
         n_embd=768,
         logit_softcap=30.0,
-        expansion_rate=2,
     ):
         super().__init__()
         self.logit_softcap = logit_softcap
@@ -98,7 +65,6 @@ class SimpleTransformerLM(nn.Module):
         self.n_embd = n_embd
         self.head_dim = n_embd // n_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.expansion_rate = expansion_rate
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
@@ -127,9 +93,16 @@ class SimpleTransformerLM(nn.Module):
 
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=block_size)
 
-        # Hyper-connections (arXiv 2409.19606) — one per sublayer per layer.
-        self.hc_attn = nn.ModuleList([HyperConnection(expansion_rate) for _ in range(n_layers)])
-        self.hc_mlp  = nn.ModuleList([HyperConnection(expansion_rate) for _ in range(n_layers)])
+        # LayerScale (CaiT, Touvron et al. 2021) — learnable per-channel residual gates.
+        # Init to 0.1 for a ~100M-class model; use 1e-4 for deeper stacks (>24 layers).
+        _ls_init = 0.1
+        self.ls_attn = nn.ParameterList([
+            nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
+        ])
+        self.ls_mlp = nn.ParameterList([
+            nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
+        ])
+ 
 
         self.ln_f = RMSNorm(n_embd)
 
@@ -160,22 +133,17 @@ class SimpleTransformerLM(nn.Module):
         if seq_len > self.block_size:
             raise ValueError("Sequence length exceeds block_size")
 
-        # x shape: (B, T, n, d) — n parallel streams for hyper-connections
         x = self.token_emb(idx)
-        x = x.unsqueeze(2).expand(-1, -1, self.expansion_rate, -1).contiguous()
-
         new_kvs = [] if use_cache else None
         for layer in range(self.n_layers):
-            # --- Attention sublayer ---
-            x_in = self.hc_attn[layer].get_input(x)   # (B, T, d)
-            x_norm = self.ln1[layer](x_in)
+            residual = x
+            x_norm = self.ln1[layer](x)
             qkv = self.qkv[layer](x_norm)
             q, k, v = qkv.chunk(3, dim=-1)
             q = q.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             k = k.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             v = v.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
             offset = past_kvs[layer][0].size(2) if past_kvs is not None else 0
-
             cos, sin = self.rope(q.size(2), offset=offset)
             q, k = apply_rope(q, k, cos, sin)
 
@@ -212,20 +180,15 @@ class SimpleTransformerLM(nn.Module):
 
             y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
             y = self.proj[layer](y)
-            x = self.hc_attn[layer].update(x, y)   # (B, T, n, d)
-
-            # --- MLP sublayer ---
-            x_in = self.hc_mlp[layer].get_input(x)  # (B, T, d)
-            x_norm = self.ln2[layer](x_in)
+            x = residual + self.ls_attn[layer] * y
+            residual = x
+            x_norm = self.ln2[layer](x)
             up = self.w_up[layer](x_norm)
             gate = self.w_gate[layer](x_norm)
             mlp_out = self.w_down[layer](LigerSiLUMulFunction.apply(gate, up))
-            x = self.hc_mlp[layer].update(x, mlp_out)  # (B, T, n, d)
-
+            x = residual + self.ls_mlp[layer] * mlp_out
             if use_cache: new_kvs.append((k, v))
 
-        # Collapse streams -> single representation before final norm
-        x = x.mean(dim=2)  # (B, T, d)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         if self.logit_softcap is not None and self.logit_softcap > 0:
