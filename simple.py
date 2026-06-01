@@ -4,11 +4,6 @@ import random
 import argparse
 import copy
 import threading
-import glob
-import struct
-
-import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +33,7 @@ ic.coordinate_descent_check_all_directions = True   # slower compile, more thoro
 # contention with DataLoader workers (we use 12 workers below).
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 os.environ.setdefault("MKL_NUM_THREADS", "8")
+
  
 # Blackwell: expandable segments reduce fragmentation over long runs
 # with large KV caches and variable-length allocations.
@@ -107,17 +103,6 @@ class SimpleTransformerLM(nn.Module):
             nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
         ])
  
-        # Cross-layer residual attention — lets each layer attend over all
-        # previous layer outputs (plus the raw embedding) to dynamically
-        # reweight which earlier representation the residual stream emphasises.
-        # cross_dim is the bottleneck for Q/K so the overhead is small.
-        self.cross_dim = max(64, n_embd // 8)
-        self.cross_ln  = nn.ModuleList([RMSNorm(n_embd) for _ in range(n_layers)])
-        self.cross_q   = nn.ModuleList([nn.Linear(n_embd, self.cross_dim, bias=False) for _ in range(n_layers)])
-        self.cross_k   = nn.ModuleList([nn.Linear(n_embd, self.cross_dim, bias=False) for _ in range(n_layers)])
-        # Init ls_cross to zero: model starts as a plain transformer and learns
-        # cross-layer routing only when it reduces loss.
-        self.ls_cross  = nn.ParameterList([nn.Parameter(torch.zeros(n_embd)) for _ in range(n_layers)])
 
         self.ln_f = RMSNorm(n_embd)
 
@@ -150,10 +135,6 @@ class SimpleTransformerLM(nn.Module):
 
         x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
-        # layer_hiddens[0] = raw embeddings; layer_hiddens[i+1] = output of layer i.
-        # Cross-layer attention at layer l attends over layer_hiddens[0..l],
-        # letting the residual stream dynamically reweight earlier representations.
-        layer_hiddens = [x]
         for layer in range(self.n_layers):
             residual = x
             x_norm = self.ln1[layer](x)
@@ -206,19 +187,6 @@ class SimpleTransformerLM(nn.Module):
             gate = self.w_gate[layer](x_norm)
             mlp_out = self.w_down[layer](LigerSiLUMulFunction.apply(gate, up))
             x = residual + self.ls_mlp[layer] * mlp_out
-
-            # Cross-layer residual attention: query from current x, keys/values
-            # from all previous layer outputs (including raw embeddings).
-            # Stack: [B, T, num_prev, D] where num_prev = layer + 1.
-            stack = torch.stack(layer_hiddens, dim=2)
-            cq = self.cross_q[layer](self.cross_ln[layer](x))          # [B, T, cross_dim]
-            ck = self.cross_k[layer](stack)                             # [B, T, num_prev, cross_dim]
-            cw = torch.einsum('btd,btld->btl', cq, ck).div(
-                math.sqrt(self.cross_dim)).softmax(dim=-1)              # [B, T, num_prev]
-            blend = torch.einsum('btl,btld->btd', cw, stack)           # [B, T, D]
-            x = x + self.ls_cross[layer] * blend
-
-            layer_hiddens.append(x)
             if use_cache: new_kvs.append((k, v))
 
         x = self.ln_f(x)
@@ -415,153 +383,6 @@ class StreamingTokenDataset(IterableDataset):
                 buf = buf[bs:]
 
 
-# ---------------------------------------------------------------------------
-# Pretokenization
-# ---------------------------------------------------------------------------
-
-# Shard file layout: 4-byte little-endian uint32 magic (0xD1CE_B1A5), 4-byte
-# uint32 token count, then token_count * uint16 token IDs.
-_SHARD_MAGIC = 0xD1CEB1A5
-_SHARD_HDR   = 8  # bytes
-
-def _write_shard(path: str, tokens: np.ndarray):
-    """Write a uint16 token shard with a small header."""
-    assert tokens.dtype == np.uint16
-    header = struct.pack("<II", _SHARD_MAGIC, len(tokens))
-    with open(path, "wb") as f:
-        f.write(header)
-        f.write(tokens.tobytes())
-
-def _read_shard_mmap(path: str) -> np.ndarray:
-    """Return a read-only uint16 memmap into the token data of a shard."""
-    n = (os.path.getsize(path) - _SHARD_HDR) // 2
-    return np.memmap(path, dtype=np.uint16, mode="r", offset=_SHARD_HDR, shape=(n,))
-
-def pretokenize_data(
-    data_dir: str,
-    tokenizer,
-    eot_id: int,
-    shard_size: int = 100_000_000,  # tokens per shard (~200 MB as uint16)
-    num_val_docs: int = VAL_DOCS,
-):
-    """Tokenize FineWeb-Edu and write uint16 binary shards to data_dir.
-
-    Shards are named train_NNNN.bin and val.bin. Existing shards are skipped
-    so interrupted runs can resume safely.
-    """
-    os.makedirs(data_dir, exist_ok=True)
-
-    def _flush_shard(buf: list, split: str, idx: int) -> list:
-        arr = np.array(buf, dtype=np.uint16)
-        out = os.path.join(data_dir, f"{split}_{idx:04d}.bin" if split == "train" else f"{split}.bin")
-        _write_shard(out, arr)
-        n_tok = len(arr)
-        print(f"  wrote {out}  ({n_tok/1e6:.1f}M tokens)")
-        return []
-
-    # --- validation shards ---
-    val_path = os.path.join(data_dir, "val.bin")
-    if os.path.exists(val_path):
-        print(f"val.bin already exists, skipping val tokenization.")
-    else:
-        print(f"Tokenizing {num_val_docs} val docs …")
-        buf, batch, BATCH = [], [], 512
-        def flush_batch():
-            if not batch: return
-            for e in tokenizer.encode_batch(batch):
-                buf.extend(e.ids); buf.append(eot_id)
-            batch.clear()
-        for ex in fineweb_edu_stream(take=num_val_docs):
-            t = ex["text"].strip()
-            if not t: continue
-            batch.append(t)
-            if len(batch) >= BATCH: flush_batch()
-        flush_batch()
-        _flush_shard(buf, "val", 0)
-
-    # --- training shards ---
-    print("Tokenizing training docs …")
-    shard_idx, buf, batch, BATCH = 0, [], [], 512
-    docs_done = 0
-
-    def flush_batch():
-        nonlocal buf
-        if not batch: return
-        for e in tokenizer.encode_batch(batch):
-            buf.extend(e.ids); buf.append(eot_id)
-        batch.clear()
-
-    for ex in fineweb_edu_stream(skip=num_val_docs):
-        t = ex["text"].strip()
-        if not t: continue
-        batch.append(t)
-        docs_done += 1
-        if len(batch) >= BATCH:
-            flush_batch()
-        if len(buf) >= shard_size:
-            shard_path = os.path.join(data_dir, f"train_{shard_idx:04d}.bin")
-            if not os.path.exists(shard_path):
-                _flush_shard(buf[:shard_size], "train", shard_idx)
-            else:
-                print(f"  {shard_path} exists, skipping.")
-            buf = buf[shard_size:]
-            shard_idx += 1
-        if docs_done % 100_000 == 0:
-            print(f"  {docs_done/1e6:.1f}M docs processed …")
-
-    # write final partial shard
-    if buf:
-        flush_batch()
-        if buf:
-            shard_path = os.path.join(data_dir, f"train_{shard_idx:04d}.bin")
-            if not os.path.exists(shard_path):
-                _flush_shard(np.array(buf, dtype=np.uint16), "train", shard_idx)
-    print("Pretokenization complete.")
-
-
-class MemmapTokenDataset(IterableDataset):
-    """Reads pretokenized uint16 shard files. Each DataLoader worker takes a
-    non-overlapping subset of shards and yields (x, y) blocks sequentially.
-    Shard order is shuffled per epoch using the worker seed for diversity."""
-
-    def __init__(self, shard_paths: list[str], block_size: int):
-        super().__init__()
-        if not shard_paths:
-            raise ValueError("No shard files found.")
-        self.shard_paths = shard_paths
-        self.block_size = block_size
-
-    def __iter__(self):
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            # Each worker handles its own slice of shards.
-            paths = self.shard_paths[worker_info.id :: worker_info.num_workers]
-            rng = random.Random(worker_info.seed)
-        else:
-            paths = self.shard_paths
-            rng = random.Random(0)
-
-        bs = self.block_size
-        epoch = 0
-        while True:
-            rng.shuffle(paths)
-            for path in paths:
-                data = _read_shard_mmap(path)
-                n = len(data)
-                # Build a list of valid start positions and shuffle them so we
-                # don't always see the same token order within a shard.
-                starts = list(range(0, n - bs, bs))
-                rng.shuffle(starts)
-                for s in starts:
-                    chunk = data[s : s + bs + 1]
-                    if len(chunk) < bs + 1:
-                        continue
-                    x = torch.from_numpy(chunk[:bs].astype(np.int64))
-                    y = torch.from_numpy(chunk[1:bs + 1].astype(np.int64))
-                    yield x, y
-            epoch += 1
-
-
 _liger_ce = LigerCrossEntropyLoss()
 
 def chunked_cross_entropy(logits, targets):
@@ -614,15 +435,6 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=999)
     parser.add_argument("--grad-accum",   type=int, default=1)
 
-    # Pretokenization
-    parser.add_argument("--pretokenize",  action="store_true",
-                        help="Tokenize FineWeb-Edu to disk and exit.")
-    parser.add_argument("--data-dir",     type=str, default=None,
-                        help="Directory of pretokenized shards. If set and shards exist, "
-                             "MemmapTokenDataset is used instead of streaming.")
-    parser.add_argument("--shard-size",   type=int, default=100_000_000,
-                        help="Tokens per training shard (default 100M ≈ 200 MB).")
- 
     args = parser.parse_args()
  
     torch.manual_seed(0)
@@ -657,32 +469,12 @@ def main():
     encode = lambda s: tokenizer.encode(s).ids
     decode = lambda ids: tokenizer.decode(ids)
 
-    if args.pretokenize:
-        if not args.data_dir:
-            raise ValueError("--pretokenize requires --data-dir")
-        pretokenize_data(
-            args.data_dir, tokenizer, eot_id, shard_size=args.shard_size,
-        )
-        return
-
     block_size = args.block_size
 
-    train_shards = sorted(glob.glob(os.path.join(args.data_dir, "train_*.bin"))) if args.data_dir else []
-    val_shard    = os.path.join(args.data_dir, "val.bin") if args.data_dir else None
-
-    if train_shards:
-        print(f"Using pretokenized data: {len(train_shards)} train shards in {args.data_dir}")
-        train_dataset = MemmapTokenDataset(train_shards, block_size)
-        if val_shard and os.path.exists(val_shard):
-            val_data = torch.from_numpy(_read_shard_mmap(val_shard).astype(np.int64))
-        else:
-            val_data = precompute_val_tokens(tokenizer, eot_id)
-    else:
-        train_dataset = StreamingTokenDataset(
-            tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
-        )
-        val_data = precompute_val_tokens(tokenizer, eot_id)
-
+    train_dataset = StreamingTokenDataset(
+        tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
+    )
+    val_data = precompute_val_tokens(tokenizer, eot_id)
     val_dataset = TokenDataset(val_data, block_size)
 
     # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
