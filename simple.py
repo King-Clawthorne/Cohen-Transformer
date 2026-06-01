@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
 from modules.muon import Muon
@@ -128,7 +127,7 @@ class SimpleTransformerLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, past_kvs=None, use_cache=False, block_mask=None):
+    def forward(self, idx, past_kvs=None, use_cache=False):
         bsz, seq_len = idx.shape
         if seq_len > self.block_size:
             raise ValueError("Sequence length exceeds block_size")
@@ -159,24 +158,26 @@ class SimpleTransformerLM(nn.Module):
             # `score * gain[h]` but expressed as a plain tensor op SDPA can fuse.
             q = q * self.qk_gain[layer].view(1, self.n_heads, 1, 1).to(q.dtype)
 
+            attn_mask = None
+            is_causal = True
             if past_len > 0:
-                # KV-cache decode: flex_attention doesn't support cross-length
-                # q/k easily, so fall back to SDPA with an explicit causal mask.
                 total_len = past_len + seq_len
                 query_positions = past_len + torch.arange(seq_len, device=q.device)
                 key_positions = torch.arange(total_len, device=q.device)
                 attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-                with sdpa_kernel(
-                    [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
-                     SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
-                    set_priority=True,
-                ):
-                    y = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=attn_mask, dropout_p=0.0,
-                        is_causal=False, scale=self.scale,
-                    )
-            else:
-                y = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
+                is_causal = False
+
+            # flex_attention uses Triton kernels that don't yet compile cleanly on
+            # Blackwell (sm_120a); cuDNN fused attention is faster there anyway.
+            with sdpa_kernel(
+                [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                 SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+                set_priority=True,
+            ):
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=0.0,
+                    is_causal=is_causal, scale=self.scale,
+                )
 
             y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
             y = self.proj[layer](y)
@@ -389,20 +390,6 @@ def chunked_cross_entropy(logits, targets):
     return _liger_ce(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
 
-_compiled_create_block_mask = torch.compile(create_block_mask)
-
-def make_block_mask(seq_len, batch_size, device, doc_ids=None):
-    if doc_ids is not None:
-        _doc = doc_ids
-        def _mask(b, h, q_idx, kv_idx):
-            return (q_idx >= kv_idx) & (_doc[b, q_idx] == _doc[b, kv_idx])
-    else:
-        def _mask(b, h, q_idx, kv_idx):
-            return q_idx >= kv_idx
-    return _compiled_create_block_mask(
-        _mask, B=batch_size, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
-    )
-
 
 def estimate_loss(model, val_loader, device, eval_iters=20):
     model.eval()
@@ -411,8 +398,7 @@ def estimate_loss(model, val_loader, device, eval_iters=20):
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            block_mask = make_block_mask(xb.size(1), xb.size(0), device)
-            logits, _ = model(xb, use_cache=False, block_mask=block_mask)
+            logits, _ = model(xb, use_cache=False)
             loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
 
@@ -598,8 +584,6 @@ def main():
 
     step       = 0
     train_iter = iter(train_loader)
-    train_block_mask = make_block_mask(block_size, args.batch_size, device)
-
     if args.resume:
         loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
         step = loaded_step + 1
@@ -642,7 +626,7 @@ def main():
                 yb = yb.to(device, non_blocking=True)
 
             with autocast_ctx:
-                logits, _ = model(xb, use_cache=False, block_mask=train_block_mask)
+                logits, _ = model(xb, use_cache=False)
                 micro_loss = chunked_cross_entropy(logits, yb) / args.grad_accum
 
             micro_loss.backward()
