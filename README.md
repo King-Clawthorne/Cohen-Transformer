@@ -62,6 +62,7 @@ Provide a clear, concise project overview and usage guide that helps a developer
 - `modules/layers.py` — `RMSNorm`, `RotaryEmbedding`, `apply_rope`
 - `modules/utils.py` — BPE training/loading, checkpoint save/load (single or list of optimizers), dataset helpers
 
-## Things I want to add in the future:
+## Things I want to add in the future
+
 1. Flex attention with document masking
 2. A better design for the residual stream
