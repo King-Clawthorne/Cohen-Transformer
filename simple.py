@@ -415,7 +415,7 @@ def main():
     parser.add_argument("--vocab-size",     type=int, default=32768)
     parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json")
     parser.add_argument("--compile-mode", type=str,   default="default",
-                        choices=["default", "reduce-overhead", "max-autotune"])
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     parser.add_argument("--eval-interval", type=int, default=999)
     parser.add_argument("--grad-accum",   type=int, default=1)
     parser.add_argument("--prompt",       type=str, default="The capital of France")
