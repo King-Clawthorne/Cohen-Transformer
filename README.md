@@ -42,10 +42,16 @@ Provide a clear, concise project overview and usage guide that helps a developer
    python simple.py --resume --max-steps 0 --prompt "The capital of France"
    ```
 
+4. Benchmark the checkpoint on TinyStories validation set:
+
+   ```bash
+   python benchmark_tinystories.py --checkpoint simple_checkpoint.pt
+   ```
+
 ## Files
 
+- `benchmark_tinystories.py` — script to evaluate perplexity and benchmark throughput of a trained model checkpoint on the TinyStories validation set
 - `simple.py` — model, training loop, FineWeb-Edu streaming dataset, FP8 wiring, cuDNN SDPA path, and generation
 - `modules/layers.py` — `RMSNorm`, `RotaryEmbedding`, `apply_rope`
 - `modules/muon.py` — Muon optimizer implementation
 - `modules/utils.py` — BPE training/loading, checkpoint save/load (single or list of optimizers), dataset helpers
-
