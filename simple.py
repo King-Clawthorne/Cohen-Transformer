@@ -296,17 +296,17 @@ class TokenDataset(Dataset):
 VAL_DOCS = 2000
 
 
-def fineweb_edu_stream(skip=0, take=None):
-    """Stream the 10B-token FineWeb-Edu sample. skip/take operate on documents.
+def stream_dataset(dataset_path, name=None, split="train", skip=0, take=None):
+    """Stream a dataset. skip/take operate on documents.
 
-    Streaming avoids downloading the full ~28GB shard set up front; HF fetches
+    Streaming avoids downloading the full shard set up front; HF fetches
     parquet shards on demand and caches them as workers consume the iterator.
     """
     from datasets import load_dataset
     ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        "sample-10BT",
-        split="train",
+        dataset_path,
+        name,
+        split=split,
         streaming=True,
     )
     if skip:
@@ -316,9 +316,9 @@ def fineweb_edu_stream(skip=0, take=None):
     return ds
 
 
-def precompute_val_tokens(tokenizer, eot_id):
+def precompute_val_tokens(tokenizer, eot_id, dataset_path, dataset_name, dataset_split="train"):
     """Tokenize the held-out val docs once at startup into a single tensor."""
-    print(f"Tokenizing {VAL_DOCS} FineWeb-Edu docs for validation...")
+    print(f"Tokenizing {VAL_DOCS} val docs from {dataset_path} for validation...")
     tokens = []
     batch, BATCH = [], 256
     def flush():
@@ -328,7 +328,7 @@ def precompute_val_tokens(tokenizer, eot_id):
             tokens.extend(e.ids)
             tokens.append(eot_id)
         batch.clear()
-    for ex in fineweb_edu_stream(take=VAL_DOCS):
+    for ex in stream_dataset(dataset_path, dataset_name, split=dataset_split, take=VAL_DOCS):
         t = ex["text"].strip()
         if not t:
             continue
@@ -348,16 +348,19 @@ class StreamingTokenDataset(IterableDataset):
     so workers don't replay the same documents.
     """
 
-    def __init__(self, tokenizer, block_size, eot_id, skip_docs=0):
+    def __init__(self, tokenizer, block_size, eot_id, dataset_path, dataset_name, dataset_split="train", skip_docs=0):
         super().__init__()
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.eot_id = eot_id
+        self.dataset_path = dataset_path
+        self.dataset_name = dataset_name
+        self.dataset_split = dataset_split
         self.skip_docs = skip_docs
 
     def __iter__(self):
         worker_info = get_worker_info()
-        ds = fineweb_edu_stream(skip=self.skip_docs)
+        ds = stream_dataset(self.dataset_path, self.dataset_name, split=self.dataset_split, skip=self.skip_docs)
         if worker_info is not None:
             ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
 
@@ -415,7 +418,7 @@ def main():
     parser.add_argument("--vocab-size",     type=int, default=32768)
     parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json")
     parser.add_argument("--compile-mode", type=str,   default="default",
-                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
+                        choices=["none", "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     parser.add_argument("--eval-interval", type=int, default=999)
     parser.add_argument("--grad-accum",   type=int, default=1)
     parser.add_argument("--prompt",       type=str, default="The capital of France")
@@ -437,11 +440,15 @@ def main():
     if device == "cuda":
         print(f"GPU : {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    DATASET_PATH = "roneneldan/TinyStories"
+    DATASET_NAME = None
+    DATASET_SPLIT = "train"
  
     # Train BPE on a sample of the stream — 50k docs (~60M chars) is plenty
     # for a 32k vocab and avoids materializing the full 10BT shard set.
     def corpus_iter():
-        for ex in fineweb_edu_stream(take=50_000):
+        for ex in stream_dataset(DATASET_PATH, DATASET_NAME, split=DATASET_SPLIT, take=50_000):
             t = ex["text"].strip()
             if t:
                 yield t
@@ -458,9 +465,9 @@ def main():
     block_size = args.block_size
 
     train_dataset = StreamingTokenDataset(
-        tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
+        tokenizer, block_size, eot_id, DATASET_PATH, DATASET_NAME, dataset_split=DATASET_SPLIT, skip_docs=VAL_DOCS,
     )
-    val_data = precompute_val_tokens(tokenizer, eot_id)
+    val_data = precompute_val_tokens(tokenizer, eot_id, DATASET_PATH, DATASET_NAME, dataset_split=DATASET_SPLIT)
     val_dataset = TokenDataset(val_data, block_size)
 
     # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
@@ -498,7 +505,8 @@ def main():
     # max-autotune: Blackwell has enough SRAM for the autotuner to find optimal
     # tile configs. First-step compile will be slow (~5-10 min).
     # Drop fullgraph=True if modules.layers has graph breaks.
-    model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
+    if args.compile_mode != "none":
+        model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
     # Hybrid optimizer: Muon for 2D body matrices, AdamW for everything else.
     # AdamW params are split into two groups: 1D/embedding tensors (norms,
