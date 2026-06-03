@@ -594,11 +594,13 @@ def main():
         _ckpt_thread = threading.Thread(target=_write, daemon=True)
         _ckpt_thread.start()
 
-    step       = 0
+    step = 0
+    cache_clear_step = 4          # fresh: empty_cache on the 3rd step
     train_iter = iter(train_loader)
     if args.resume:
         loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
         step = loaded_step + 1
+        cache_clear_step += loaded_step
         if step >= max_steps:
             print(
                 f"Checkpoint step {loaded_step} already reaches/exceeds "
@@ -654,6 +656,9 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
+
+        if step == cache_clear_step:
+            torch.cuda.empty_cache()
 
         if step % eval_interval == 0:
             val_loss  = estimate_loss(model, val_loader, device)
