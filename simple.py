@@ -659,6 +659,7 @@ def main():
 
         if step == cache_clear_step:
             torch.cuda.empty_cache()
+            print(f"CUDA cache cleared to reduce fragmentation for KV cache.")
 
         if step % eval_interval == 0:
             val_loss  = estimate_loss(model, val_loader, device)
