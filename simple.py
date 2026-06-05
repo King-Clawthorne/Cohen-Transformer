@@ -621,6 +621,23 @@ def main():
     autocast_ctx = torch.amp.autocast(device, dtype=torch.bfloat16, enabled=(device == "cuda"))
  
     while step < max_steps:
+        # CUDA graphs (reduce-overhead / max-autotune) reuse static output
+        # buffers across invocations. We retain references to graphed outputs
+        # past the step boundary (loss.item() at eval, loss accumulated across
+        # micro-steps), so mark the step start to let the graph reclaim and
+        # reuse that memory safely instead of overwriting live tensors.
+        #
+        # NOTE: this must stay once-per-optimizer-step, NOT per micro-step.
+        # Gradient accumulation reads each micro-step's grad buffer to add the
+        # next one; marking per micro-step lets the graph reclaim that buffer
+        # early, which corrupts the accumulation ("accessing tensor output of
+        # CUDAGraphs that has been overwritten"). The cost is that the graph
+        # pool keeps one activation region per micro-step, so peak reserved
+        # memory scales with --grad-accum under cudagraph modes. To keep memory
+        # flat with grad-accum, drop cudagraphs (--compile-mode default or
+        # max-autotune-no-cudagraphs) instead.
+        torch.compiler.cudagraph_mark_step_begin()
+
         lr = get_lr(step)
         for opt in optimizers:
             for param_group in opt.param_groups:
@@ -639,15 +656,6 @@ def main():
 
         loss = 0.0
         for micro_step in range(args.grad_accum):
-            # Mark each micro-step as its own CUDA-graph iteration so the graph
-            # pool can reclaim and reuse each micro-step's activation/output
-            # memory instead of reserving a distinct region per micro-step.
-            # This keeps peak reserved memory flat as --grad-accum grows (it
-            # otherwise scaled ~linearly). Gradients still accumulate correctly
-            # because they live in the .grad buffers, not the graphed outputs,
-            # and the running loss is copied into a separate accumulator below
-            # before the next mark reclaims the micro-step's output buffer.
-            torch.compiler.cudagraph_mark_step_begin()
             if micro_step > 0:
                 try:
                     xb, yb = next(train_iter)
