@@ -416,7 +416,7 @@ def estimate_loss(model, val_loader, device, eval_iters=20):
     return sum(losses) / len(losses) if losses else 0.0
 
 def main():
-    parser = argparse.ArgumentParser(description="SimpleTransformerLM — FineWeb-Edu (streaming)")
+    parser = argparse.ArgumentParser(description="SimpleTransformerLM")
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
