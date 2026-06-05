@@ -346,7 +346,7 @@ def precompute_val_tokens(tokenizer, eot_id, dataset_path, dataset_name, dataset
 
 class StreamingTokenDataset(IterableDataset):
     """
-    Streams FineWeb-Edu, tokenizes on the fly, packs the token stream into a
+    Streams the configured dataset, tokenizes on the fly, packs the token stream into a
     rolling buffer, and yields non-overlapping (x, y) blocks for next-token
     prediction. Each DataLoader worker takes a distinct shard of the stream
     so workers don't replay the same documents.
@@ -481,7 +481,7 @@ def main():
 
     # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
     # process and the OS without causing core contention. Each train worker
-    # streams its own shard of FineWeb-Edu so they don't replay docs.
+    # streams its own shard of the dataset so they don't replay docs.
     loader_kwargs = dict(
         num_workers=2,
         pin_memory=True,
@@ -490,7 +490,7 @@ def main():
         drop_last=True,
     )
 
-    # IterableDataset can't be shuffled by the loader — FineWeb-Edu's row order
+    # IterableDataset can't be shuffled by the loader — the streamed row order
     # is already arbitrary across shards, so this is fine for pretraining.
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
