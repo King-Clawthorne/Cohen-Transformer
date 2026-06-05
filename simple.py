@@ -188,7 +188,11 @@ class SimpleTransformerLM(nn.Module):
         logits = self.lm_head(x)
         if self.logit_softcap is not None and self.logit_softcap > 0:
             cap = self.logit_softcap
-            logits = torch.tanh(logits / cap) * cap
+            # Fold the softcap in-place: `tanh(logits / cap) * cap` would
+            # allocate two extra full-size (B*T, vocab) temporaries; the in-place
+            # chain mutates the single logits buffer instead. Autograd records
+            # the tanh output, so backward is unaffected.
+            logits = logits.div_(cap).tanh_().mul_(cap)
         return logits, new_kvs
 
     @torch.no_grad()
@@ -391,6 +395,10 @@ def chunked_cross_entropy(logits, targets):
 def estimate_loss(model, val_loader, device, eval_iters=20):
     model.eval()
     losses = []
+    # Match the training dtype: without autocast the eval forward materializes
+    # full fp32 logits (B*T, vocab), which is ~2x the bf16 footprint and spikes
+    # peak memory well above the training path.
+    autocast_ctx = torch.amp.autocast(device, dtype=torch.bfloat16, enabled=(device == "cuda"))
     with torch.no_grad():
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
@@ -399,8 +407,9 @@ def estimate_loss(model, val_loader, device, eval_iters=20):
             # clobbering a tensor that may still be referenced.
             torch.compiler.cudagraph_mark_step_begin()
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            logits, _ = model(xb, use_cache=False)
-            loss = chunked_cross_entropy(logits, yb)
+            with autocast_ctx:
+                logits, _ = model(xb, use_cache=False)
+                loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
 
     model.train()
@@ -418,7 +427,7 @@ def main():
     parser.add_argument("--vocab-size",     type=int, default=32768)
     parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json")
     parser.add_argument("--compile-mode", type=str,   default="default",
-                        choices=["none", "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     parser.add_argument("--eval-interval", type=int, default=999)
     parser.add_argument("--grad-accum",   type=int, default=1)
     parser.add_argument("--prompt",       type=str, default="The capital of France")
