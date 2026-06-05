@@ -32,7 +32,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "8")
 # with large KV caches and variable-length allocations.
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,max_split_size_mb:512",
+    "expandable_segments:True",
 )
 
 class SimpleTransformerLM(nn.Module):
@@ -188,7 +188,11 @@ class SimpleTransformerLM(nn.Module):
         logits = self.lm_head(x)
         if self.logit_softcap is not None and self.logit_softcap > 0:
             cap = self.logit_softcap
-            logits = torch.tanh(logits / cap) * cap
+            # Fold the softcap to avoid extra full-size (B*T, vocab) temporaries.
+            # div_ and tanh_ run in-place on the logits buffer; the final `* cap`
+            # must stay out-of-place because TanhBackward needs an unmodified
+            # copy of the tanh output for the backward pass.
+            logits = logits.div_(cap).tanh_() * cap
         return logits, new_kvs
 
     @torch.no_grad()
@@ -296,17 +300,17 @@ class TokenDataset(Dataset):
 VAL_DOCS = 2000
 
 
-def fineweb_edu_stream(skip=0, take=None):
-    """Stream the 10B-token FineWeb-Edu sample. skip/take operate on documents.
+def stream_dataset(dataset_path, name=None, split="train", skip=0, take=None):
+    """Stream a dataset. skip/take operate on documents.
 
-    Streaming avoids downloading the full ~28GB shard set up front; HF fetches
+    Streaming avoids downloading the full shard set up front; HF fetches
     parquet shards on demand and caches them as workers consume the iterator.
     """
     from datasets import load_dataset
     ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        "sample-10BT",
-        split="train",
+        dataset_path,
+        name,
+        split=split,
         streaming=True,
     )
     if skip:
@@ -316,9 +320,9 @@ def fineweb_edu_stream(skip=0, take=None):
     return ds
 
 
-def precompute_val_tokens(tokenizer, eot_id):
+def precompute_val_tokens(tokenizer, eot_id, dataset_path, dataset_name, dataset_split="train"):
     """Tokenize the held-out val docs once at startup into a single tensor."""
-    print(f"Tokenizing {VAL_DOCS} FineWeb-Edu docs for validation...")
+    print(f"Tokenizing {VAL_DOCS} val docs from {dataset_path} for validation...")
     tokens = []
     batch, BATCH = [], 256
     def flush():
@@ -328,7 +332,7 @@ def precompute_val_tokens(tokenizer, eot_id):
             tokens.extend(e.ids)
             tokens.append(eot_id)
         batch.clear()
-    for ex in fineweb_edu_stream(take=VAL_DOCS):
+    for ex in stream_dataset(dataset_path, dataset_name, split=dataset_split, take=VAL_DOCS):
         t = ex["text"].strip()
         if not t:
             continue
@@ -342,22 +346,25 @@ def precompute_val_tokens(tokenizer, eot_id):
 
 class StreamingTokenDataset(IterableDataset):
     """
-    Streams FineWeb-Edu, tokenizes on the fly, packs the token stream into a
+    Streams the configured dataset, tokenizes on the fly, packs the token stream into a
     rolling buffer, and yields non-overlapping (x, y) blocks for next-token
     prediction. Each DataLoader worker takes a distinct shard of the stream
     so workers don't replay the same documents.
     """
 
-    def __init__(self, tokenizer, block_size, eot_id, skip_docs=0):
+    def __init__(self, tokenizer, block_size, eot_id, dataset_path, dataset_name, dataset_split="train", skip_docs=0):
         super().__init__()
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.eot_id = eot_id
+        self.dataset_path = dataset_path
+        self.dataset_name = dataset_name
+        self.dataset_split = dataset_split
         self.skip_docs = skip_docs
 
     def __iter__(self):
         worker_info = get_worker_info()
-        ds = fineweb_edu_stream(skip=self.skip_docs)
+        ds = stream_dataset(self.dataset_path, self.dataset_name, split=self.dataset_split, skip=self.skip_docs)
         if worker_info is not None:
             ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
 
@@ -388,6 +395,10 @@ def chunked_cross_entropy(logits, targets):
 def estimate_loss(model, val_loader, device, eval_iters=20):
     model.eval()
     losses = []
+    # Match the training dtype: without autocast the eval forward materializes
+    # full fp32 logits (B*T, vocab), which is ~2x the bf16 footprint and spikes
+    # peak memory well above the training path.
+    autocast_ctx = torch.amp.autocast(device, dtype=torch.bfloat16, enabled=(device == "cuda"))
     with torch.no_grad():
         for i, (xb, yb) in enumerate(val_loader):
             if i >= eval_iters: break
@@ -396,15 +407,16 @@ def estimate_loss(model, val_loader, device, eval_iters=20):
             # clobbering a tensor that may still be referenced.
             torch.compiler.cudagraph_mark_step_begin()
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            logits, _ = model(xb, use_cache=False)
-            loss = chunked_cross_entropy(logits, yb)
+            with autocast_ctx:
+                logits, _ = model(xb, use_cache=False)
+                loss = chunked_cross_entropy(logits, yb)
             losses.append(loss.item())
 
     model.train()
     return sum(losses) / len(losses) if losses else 0.0
 
 def main():
-    parser = argparse.ArgumentParser(description="SimpleTransformerLM — FineWeb-Edu (streaming)")
+    parser = argparse.ArgumentParser(description="SimpleTransformerLM")
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
@@ -437,11 +449,15 @@ def main():
     if device == "cuda":
         print(f"GPU : {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    DATASET_PATH = "roneneldan/TinyStories"
+    DATASET_NAME = None
+    DATASET_SPLIT = "train"
  
     # Train BPE on a sample of the stream — 50k docs (~60M chars) is plenty
     # for a 32k vocab and avoids materializing the full 10BT shard set.
     def corpus_iter():
-        for ex in fineweb_edu_stream(take=50_000):
+        for ex in stream_dataset(DATASET_PATH, DATASET_NAME, split=DATASET_SPLIT, take=50_000):
             t = ex["text"].strip()
             if t:
                 yield t
@@ -458,14 +474,14 @@ def main():
     block_size = args.block_size
 
     train_dataset = StreamingTokenDataset(
-        tokenizer, block_size, eot_id, skip_docs=VAL_DOCS,
+        tokenizer, block_size, eot_id, DATASET_PATH, DATASET_NAME, dataset_split=DATASET_SPLIT, skip_docs=VAL_DOCS,
     )
-    val_data = precompute_val_tokens(tokenizer, eot_id)
+    val_data = precompute_val_tokens(tokenizer, eot_id, DATASET_PATH, DATASET_NAME, dataset_split=DATASET_SPLIT)
     val_dataset = TokenDataset(val_data, block_size)
 
     # EPYC 9355: 48C/96T — 2 workers per loader leaves headroom for the main
     # process and the OS without causing core contention. Each train worker
-    # streams its own shard of FineWeb-Edu so they don't replay docs.
+    # streams its own shard of the dataset so they don't replay docs.
     loader_kwargs = dict(
         num_workers=2,
         pin_memory=True,
@@ -474,7 +490,7 @@ def main():
         drop_last=True,
     )
 
-    # IterableDataset can't be shuffled by the loader — FineWeb-Edu's row order
+    # IterableDataset can't be shuffled by the loader — the streamed row order
     # is already arbitrary across shards, so this is fine for pretraining.
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
@@ -498,7 +514,8 @@ def main():
     # max-autotune: Blackwell has enough SRAM for the autotuner to find optimal
     # tile configs. First-step compile will be slow (~5-10 min).
     # Drop fullgraph=True if modules.layers has graph breaks.
-    model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
+    if args.compile_mode != "none":
+        model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
     # Hybrid optimizer: Muon for 2D body matrices, AdamW for everything else.
     # AdamW params are split into two groups: 1D/embedding tensors (norms,
@@ -586,11 +603,13 @@ def main():
         _ckpt_thread = threading.Thread(target=_write, daemon=True)
         _ckpt_thread.start()
 
-    step       = 0
+    step = 0
+    cache_clear_step = 4          # fresh: empty_cache on the 3rd step
     train_iter = iter(train_loader)
     if args.resume:
         loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
         step = loaded_step + 1
+        cache_clear_step += loaded_step
         if step >= max_steps:
             print(
                 f"Checkpoint step {loaded_step} already reaches/exceeds "
@@ -607,6 +626,16 @@ def main():
         # past the step boundary (loss.item() at eval, loss accumulated across
         # micro-steps), so mark the step start to let the graph reclaim and
         # reuse that memory safely instead of overwriting live tensors.
+        #
+        # NOTE: this must stay once-per-optimizer-step, NOT per micro-step.
+        # Gradient accumulation reads each micro-step's grad buffer to add the
+        # next one; marking per micro-step lets the graph reclaim that buffer
+        # early, which corrupts the accumulation ("accessing tensor output of
+        # CUDAGraphs that has been overwritten"). The cost is that the graph
+        # pool keeps one activation region per micro-step, so peak reserved
+        # memory scales with --grad-accum under cudagraph modes. To keep memory
+        # flat with grad-accum, drop cudagraphs (--compile-mode default or
+        # max-autotune-no-cudagraphs) instead.
         torch.compiler.cudagraph_mark_step_begin()
 
         lr = get_lr(step)
@@ -625,7 +654,7 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        loss = None
+        loss = 0.0
         for micro_step in range(args.grad_accum):
             if micro_step > 0:
                 try:
@@ -641,11 +670,15 @@ def main():
                 micro_loss = chunked_cross_entropy(logits, yb) / args.grad_accum
 
             micro_loss.backward()
-            loss = micro_loss if loss is None else loss + micro_loss
+            loss += micro_loss.detach()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
+
+        if step == cache_clear_step:
+            torch.cuda.empty_cache()
+            print(f"CUDA cache cleared to reduce fragmentation for KV cache.")
 
         if step % eval_interval == 0:
             val_loss  = estimate_loss(model, val_loader, device)

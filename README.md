@@ -45,7 +45,7 @@ Provide a clear, concise project overview and usage guide that helps a developer
 4. Benchmark the checkpoint on TinyStories validation set:
 
    ```bash
-   python benchmark_tinystories.py --checkpoint simple_checkpoint.pt
+   python benchmark.py --checkpoint simple_checkpoint.pt
    ```
 
 ## Files
