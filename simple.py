@@ -32,7 +32,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "8")
 # with large KV caches and variable-length allocations.
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,max_split_size_mb:512",
+    "expandable_segments:True",
 )
 
 class SimpleTransformerLM(nn.Module):
