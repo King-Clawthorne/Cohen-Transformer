@@ -398,7 +398,10 @@ def main():
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint")
     parser.add_argument("--resume",       action="store_true")
     parser.add_argument("--vocab-size",     type=int, default=32768)
-    parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json")
+    # BPE cache; the tokenizer is corpus-specific, so point this at a distinct
+    # file when you change DATASET_PATH rather than reusing one trained on
+    # another corpus.
+    parser.add_argument("--tokenizer-path", type=str, default="bpe.json")
     parser.add_argument("--compile-mode", type=str,   default="default",
                         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     parser.add_argument("--eval-interval", type=int, default=999)
