@@ -1,4 +1,19 @@
 import os
+import warnings
+import logging
+
+# Suppress Python warnings (torch.distributed checkpoint UserWarnings, etc.)
+warnings.filterwarnings("ignore")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+
+# Silence HuggingFace Hub messages (e.g. unauthenticated request warning)
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 import math
 import random
 import argparse
