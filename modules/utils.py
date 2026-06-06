@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict_saver import async_save
+from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from pathlib import Path
 from datasets import load_dataset
@@ -78,6 +79,7 @@ def save_checkpoint_async(
     future = async_save(
         {"model": model_sd, "optims": optim_sd, "step": step},
         checkpoint_id=checkpoint_id,
+        storage_writer=FileSystemWriter(checkpoint_id, overwrite=True),
     )
     print(f"Checkpoint staged for {checkpoint_id} at step {step} (writing in background)")
     return future
