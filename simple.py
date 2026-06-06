@@ -39,12 +39,17 @@ class SimpleTransformerLM(nn.Module):
         n_layers=12,
         n_heads=12,
         n_embd=768,
+        eot_id=None,
     ):
         super().__init__()
 
         if n_embd % n_heads != 0:
             raise ValueError("n_embd must be divisible by n_heads")
 
+        # Token id that terminates each packed document. When set, the forward
+        # pass builds a block-diagonal document mask so attention never crosses
+        # a document boundary within a packed block.
+        self.eot_id = eot_id
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layers = n_layers
@@ -72,6 +77,27 @@ class SimpleTransformerLM(nn.Module):
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
+    def _build_document_mask(self, idx):
+        """Block-diagonal causal mask that keeps attention inside each document.
+
+        Documents are packed end-to-end and separated by `eot_id` (the eot token
+        is the last token of its document). A token starts a new document iff the
+        previous token was an eot, so a cumulative count of those boundaries
+        gives each token a document id. Tokens may attend to earlier tokens that
+        share their document id — i.e. causal AND same-document.
+
+        Returns a boolean mask of shape [B, 1, seq, seq] (True = attend) suitable
+        for SDPA's attn_mask, broadcast over heads.
+        """
+        # prev_is_eot[b, i] = (idx[b, i-1] == eot_id), with False at position 0.
+        prev_is_eot = F.pad((idx == self.eot_id)[:, :-1], (1, 0), value=False)
+        doc_ids = prev_is_eot.cumsum(dim=1)                       # [B, seq]
+        same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]     # [B, seq, seq]
+        causal = torch.ones(
+            idx.size(1), idx.size(1), dtype=torch.bool, device=idx.device
+        ).tril()
+        return (same_doc & causal).unsqueeze(1)                   # [B, 1, seq, seq]
+
     def forward(self, idx, past_kvs=None, use_cache=False):
         bsz, seq_len = idx.shape
         if seq_len > self.block_size:
@@ -80,13 +106,20 @@ class SimpleTransformerLM(nn.Module):
         x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
 
+        # Document masking only applies to the full-context training/eval path.
+        # During cached generation each call extends a single sequence, so the
+        # plain causal path in Block handles it.
+        attn_mask = None
+        if self.eot_id is not None and not use_cache:
+            attn_mask = self._build_document_mask(idx)
+
         # RoPE cos/sin are shared across all blocks: compute once for this step.
         offset = past_kvs[0][0].size(2) if past_kvs is not None else 0
         cos, sin = self.rope(seq_len, offset=offset)
 
         for layer, block in enumerate(self.blocks):
             past_kv = past_kvs[layer] if past_kvs is not None else None
-            x, new_kv = block(x, cos, sin, past_kv=past_kv, use_cache=use_cache)
+            x, new_kv = block(x, cos, sin, attn_mask=attn_mask, past_kv=past_kv, use_cache=use_cache)
             if use_cache:
                 new_kvs.append(new_kv)
 
@@ -426,6 +459,7 @@ def main():
     model = SimpleTransformerLM(
         vocab_size=padded_vocab_size,
         block_size=block_size,
+        eot_id=eot_id,
     ).to(device)
  
     n_params = sum(p.numel() for p in model.parameters())

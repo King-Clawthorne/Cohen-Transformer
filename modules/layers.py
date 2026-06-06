@@ -158,7 +158,7 @@ class Block(nn.Module):
         nn.init.normal_(self.proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
         nn.init.normal_(self.w_down.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
 
-    def forward(self, x, cos, sin, past_kv=None, use_cache=False):
+    def forward(self, x, cos, sin, attn_mask=None, past_kv=None, use_cache=False):
         bsz, seq_len, _ = x.shape
 
         residual = x
@@ -186,8 +186,11 @@ class Block(nn.Module):
         # expressed as a plain tensor op SDPA can fuse.
         q = q * self.qk_gain.view(1, self.n_heads, 1, 1).to(q.dtype)
 
-        attn_mask = None
-        is_causal = True
+        # A document mask (passed in by the parent) takes the is_causal slot:
+        # SDPA can't combine is_causal=True with an explicit attn_mask, so when
+        # a mask is supplied it must already encode causality (see the parent's
+        # _build_document_mask).
+        is_causal = attn_mask is None
         if past_len > 0:
             total_len = past_len + seq_len
             query_positions = past_len + torch.arange(seq_len, device=q.device)
