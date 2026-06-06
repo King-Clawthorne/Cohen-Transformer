@@ -146,7 +146,6 @@ class SimpleTransformerLM(nn.Module):
     def generate(
         self,
         idx,
-        max_new_tokens,
         temperature=1.0,
         top_k=None,
         top_p=None,
@@ -164,9 +163,10 @@ class SimpleTransformerLM(nn.Module):
                             adaptive: bar rises when model is confident,
                             falls when uncertain — best for killing rep loops
 
-        If `eos_token_id` is given, generation stops early once every sequence in
-        the batch has emitted it; already-finished rows are padded with EOS so the
-        returned tensor stays rectangular.
+        Generation runs until every sequence in the batch has emitted
+        `eos_token_id`; already-finished rows are padded with EOS so the returned
+        tensor stays rectangular. EOS is the only thing that ends generation, so
+        a valid `eos_token_id` is required to avoid looping forever.
         """
         was_training = self.training
         self.eval()
@@ -175,9 +175,14 @@ class SimpleTransformerLM(nn.Module):
             if idx.size(1) == 0:
                 raise ValueError("Prompt must contain at least one token")
 
+            if eos_token_id is None:
+                raise ValueError(
+                    "eos_token_id is required: generation only stops at EOS"
+                )
+
             past_kvs = None
             finished = torch.zeros(idx.size(0), 1, dtype=torch.bool, device=idx.device)
-            for _ in range(max_new_tokens):
+            while True:
                 idx_cond = idx[:, -self.block_size:]
                 if past_kvs is None:
                     logits, past_kvs = self.forward(idx_cond, use_cache=True)
@@ -399,7 +404,6 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=999)
     parser.add_argument("--grad-accum",   type=int, default=1)
     parser.add_argument("--prompt",       type=str, default="The capital of France")
-    parser.add_argument("--max-new-tokens", type=int, default=100)
 
     args = parser.parse_args()
  
@@ -673,7 +677,6 @@ def main():
         with torch.no_grad():
             out = model.generate(
                 context.clone(),
-                max_new_tokens=args.max_new_tokens,
                 eos_token_id=eot_id,
                 **cfg,
             )
