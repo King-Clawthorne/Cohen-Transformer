@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict_saver import async_save
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from pathlib import Path
 from datasets import load_dataset
 
@@ -46,69 +49,71 @@ def init_weights(module: nn.Module, std: float = 0.02):
         if hasattr(module, 'bias') and module.bias is not None:
             nn.init.zeros_(module.bias)
 
-def save_checkpoint(
+def save_checkpoint_async(
     model: nn.Module,
-    optimizer,
+    optimizers,
     step: int,
-    checkpoint_path: str,
-    **extra,
+    checkpoint_id: str,
+    prev_future=None,
 ):
-    """Save model, optimizer state, and training step to checkpoint.
+    """Save model + optimizer state + step using PyTorch's built-in async
+    Distributed Checkpoint (`dcp.async_save`).
 
-    `optimizer` may be a single Optimizer or a list/tuple of them (e.g. a
-    Muon + AdamW hybrid). The list form is stored under
-    `optimizer_state_dicts` so it round-trips cleanly through `load_checkpoint`.
+    `async_save` stages the state dict (to CPU) synchronously and writes it to
+    disk on a background thread, so the training loop is not blocked by I/O —
+    replacing the previous hand-rolled snapshot-and-thread logic. It returns a
+    Future; pass it back in as `prev_future` on the next call so we wait for the
+    previous write to finish before staging a new one.
+
+    `optimizers` may be a single Optimizer or a list/tuple (Muon + AdamW hybrid).
+    `get_state_dict` produces optimizer state that round-trips cleanly into fresh,
+    un-stepped optimizers via `set_state_dict` in `load_checkpoint`.
     """
-    if isinstance(optimizer, (list, tuple)):
-        opt_payload = {"optimizer_state_dicts": [o.state_dict() for o in optimizer]}
-    else:
-        opt_payload = {"optimizer_state_dict": optimizer.state_dict()}
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        **opt_payload,
-        "step": step,
-    }
-    if extra:
-        checkpoint.update(extra)
-    torch.save(checkpoint, checkpoint_path)
-    print(f"Checkpoint saved to {checkpoint_path} at step {step}")
+    if prev_future is not None:
+        prev_future.result()
+    if not isinstance(optimizers, (list, tuple)):
+        optimizers = [optimizers]
+
+    model_sd, optim_sd = get_state_dict(model, optimizers)
+    future = async_save(
+        {"model": model_sd, "optims": optim_sd, "step": step},
+        checkpoint_id=checkpoint_id,
+    )
+    print(f"Checkpoint staged for {checkpoint_id} at step {step} (writing in background)")
+    return future
+
 
 def load_checkpoint(
     model: nn.Module,
-    optimizer,
-    checkpoint_path: str,
-    device: str,
-    return_checkpoint: bool = False,
+    optimizers,
+    checkpoint_id: str,
+    device: str = None,
 ):
-    """Load model, optimizer state, and training step from checkpoint.
+    """Load model, optimizer state, and training step from a DCP checkpoint.
 
-    `optimizer` may be a single Optimizer or a list/tuple. If the checkpoint's
-    optimizer format does not match (e.g. resuming an AdamW-only checkpoint
-    after swapping in a Muon hybrid), the optimizer state is skipped with a
-    warning and only the model weights and step counter are restored.
+    DCP loads in place, so we seed the load with the current (possibly empty)
+    state dicts via `get_state_dict`, run `dcp.load`, then apply the loaded
+    tensors back onto the live model/optimizers with `set_state_dict` — which
+    correctly materializes optimizer state into fresh optimizers. Returns the
+    saved step. `device` is accepted for backward compatibility and unused (DCP
+    places tensors to match the live model).
     """
-    if not Path(checkpoint_path).exists():
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+    if not Path(checkpoint_id).exists():
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_id}")
+    if not isinstance(optimizers, (list, tuple)):
+        optimizers = [optimizers]
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    if optimizer is not None:
-        if isinstance(optimizer, (list, tuple)):
-            states = checkpoint.get("optimizer_state_dicts")
-            if states is not None and len(states) == len(optimizer):
-                for o, s in zip(optimizer, states):
-                    o.load_state_dict(s)
-            else:
-                print(
-                    "Warning: checkpoint optimizer format does not match current "
-                    "optimizer setup; skipping optimizer state load."
-                )
-        elif "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    step = checkpoint.get("step", 0)
-    print(f"Checkpoint loaded from {checkpoint_path}, resuming from step {step}")
-    if return_checkpoint:
-        return step, checkpoint
+    model_sd, optim_sd = get_state_dict(model, optimizers)
+    state = {"model": model_sd, "optims": optim_sd, "step": 0}
+    dcp.load(state, checkpoint_id=checkpoint_id)
+    set_state_dict(
+        model,
+        optimizers,
+        model_state_dict=state["model"],
+        optim_state_dict=state["optims"],
+    )
+    step = state["step"]
+    print(f"Checkpoint loaded from {checkpoint_id}, resuming from step {step}")
     return step
 
 def load_hf_dataset(dataset_name: str = "wikitext", config_name: str = None, split: str = "train"):

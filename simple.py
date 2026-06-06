@@ -2,23 +2,19 @@ import os
 import math
 import random
 import argparse
-import copy
-import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
 from modules.muon import Muon
 
-from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
-from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
+from modules.layers import RMSNorm, RotaryEmbedding, Block
 from modules.utils import (
     load_checkpoint,
-    save_checkpoint,
+    save_checkpoint_async,
     train_or_load_bpe,
 )
 
@@ -43,10 +39,8 @@ class SimpleTransformerLM(nn.Module):
         n_layers=12,
         n_heads=12,
         n_embd=768,
-        logit_softcap=30.0,
     ):
         super().__init__()
-        self.logit_softcap = logit_softcap
 
         if n_embd % n_heads != 0:
             raise ValueError("n_embd must be divisible by n_heads")
@@ -57,69 +51,26 @@ class SimpleTransformerLM(nn.Module):
         self.n_heads = n_heads
         self.n_embd = n_embd
         self.head_dim = n_embd // n_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
-        self.ln1 = nn.ModuleList([RMSNorm(n_embd) for _ in range(n_layers)])
-        self.ln2 = nn.ModuleList([RMSNorm(n_embd) for _ in range(n_layers)])
-
-        self.qkv = nn.ModuleList([nn.Linear(n_embd, 3 * n_embd, bias=False) for _ in range(n_layers)])
-        self.proj = nn.ModuleList([nn.Linear(n_embd, n_embd, bias=False) for _ in range(n_layers)])
-
-        # QK-gain: learnable per-head multiplicative gain on the attention scale.
-        # Init to 1.0 so initial behavior matches the fixed 1/sqrt(d_k) baseline.
-        self.qk_gain = nn.ParameterList([
-            nn.Parameter(torch.ones(n_heads)) for _ in range(n_layers)
+        self.blocks = nn.ModuleList([
+            Block(n_embd, n_heads, n_layers) for _ in range(n_layers)
         ])
-
-        self.w_up = nn.ModuleList()
-        self.w_gate = nn.ModuleList()
-        self.w_down = nn.ModuleList()
-
-        for _ in range(n_layers):
-            hidden_dim = int(8 * n_embd / 3)
-            hidden_dim = ((hidden_dim + 127) // 128) * 128
-            self.w_up.append(nn.Linear(n_embd, hidden_dim, bias=False))
-            self.w_gate.append(nn.Linear(n_embd, hidden_dim, bias=False))
-            self.w_down.append(nn.Linear(hidden_dim, n_embd, bias=False))
 
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=block_size)
 
-        # LayerScale (CaiT, Touvron et al. 2021) — learnable per-channel residual gates.
-        # Init to 0.1 for a ~100M-class model; use 1e-4 for deeper stacks (>24 layers).
-        _ls_init = 0.1
-        self.ls_attn = nn.ParameterList([
-            nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
-        ])
-        self.ls_mlp = nn.ParameterList([
-            nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
-        ])
- 
-
         self.ln_f = RMSNorm(n_embd)
 
+        # Untied LM head: a separate output projection (no longer sharing the
+        # token-embedding weight). Costs embedding-sized params but typically
+        # improves loss at this scale.
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight
-        self.apply(self._init_weights)
-
-        for i in range(n_layers):
-            nn.init.normal_(
-                self.proj[i].weight,
-                mean=0.0,
-                std=0.02 / math.sqrt(2 * n_layers),
-            )
-            nn.init.normal_(
-                self.w_down[i].weight,
-                mean=0.0,
-                std=0.02 / math.sqrt(2 * n_layers),
-            )
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # Blocks initialize their own weights in Block.__init__; here we only
+        # init the embedding and the (now untied) LM head, so we don't clobber
+        # the blocks' scaled residual-projection init.
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, past_kvs=None, use_cache=False):
         bsz, seq_len = idx.shape
@@ -128,71 +79,19 @@ class SimpleTransformerLM(nn.Module):
 
         x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
-        for layer in range(self.n_layers):
-            residual = x
-            x_norm = self.ln1[layer](x)
-            qkv = self.qkv[layer](x_norm)
-            q, k, v = qkv.chunk(3, dim=-1)
-            q = q.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-            k = k.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-            v = v.view(bsz, seq_len, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-            offset = past_kvs[layer][0].size(2) if past_kvs is not None else 0
-            cos, sin = self.rope(q.size(2), offset=offset)
-            q, k = apply_rope(q, k, cos, sin)
 
-            past_len = 0
-            if past_kvs is not None:
-                past_k, past_v = past_kvs[layer]
-                past_len = past_k.size(2)
-                k = torch.cat([past_k, k], dim=2)
-                v = torch.cat([past_v, v], dim=2)
+        # RoPE cos/sin are shared across all blocks: compute once for this step.
+        offset = past_kvs[0][0].size(2) if past_kvs is not None else 0
+        cos, sin = self.rope(seq_len, offset=offset)
 
-            # QK-gain: fold the learnable per-head gain into q so it scales the
-            # q·k score before softmax — equivalent to the old score_mod's
-            # `score * gain[h]` but expressed as a plain tensor op SDPA can fuse.
-            q = q * self.qk_gain[layer].view(1, self.n_heads, 1, 1).to(q.dtype)
-
-            attn_mask = None
-            is_causal = True
-            if past_len > 0:
-                total_len = past_len + seq_len
-                query_positions = past_len + torch.arange(seq_len, device=q.device)
-                key_positions = torch.arange(total_len, device=q.device)
-                attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-                is_causal = False
-
-            # flex_attention uses Triton kernels that don't yet compile cleanly on
-            # Blackwell (sm_120a); cuDNN fused attention is faster there anyway.
-            with sdpa_kernel(
-                [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
-                 SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
-                set_priority=True,
-            ):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=0.0,
-                    is_causal=is_causal, scale=self.scale,
-                )
-
-            y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
-            y = self.proj[layer](y)
-            x = residual + self.ls_attn[layer] * y
-            residual = x
-            x_norm = self.ln2[layer](x)
-            up = self.w_up[layer](x_norm)
-            gate = self.w_gate[layer](x_norm)
-            mlp_out = self.w_down[layer](LigerSiLUMulFunction.apply(gate, up))
-            x = residual + self.ls_mlp[layer] * mlp_out
-            if use_cache: new_kvs.append((k, v))
+        for layer, block in enumerate(self.blocks):
+            past_kv = past_kvs[layer] if past_kvs is not None else None
+            x, new_kv = block(x, cos, sin, past_kv=past_kv, use_cache=use_cache)
+            if use_cache:
+                new_kvs.append(new_kv)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
-        if self.logit_softcap is not None and self.logit_softcap > 0:
-            cap = self.logit_softcap
-            # Fold the softcap to avoid extra full-size (B*T, vocab) temporaries.
-            # div_ and tanh_ run in-place on the logits buffer; the final `* cap`
-            # must stay out-of-place because TanhBackward needs an unmodified
-            # copy of the tanh output for the backward pass.
-            logits = logits.div_(cap).tanh_() * cap
         return logits, new_kvs
 
     @torch.no_grad()
@@ -205,6 +104,7 @@ class SimpleTransformerLM(nn.Module):
         top_p=None,
         min_p=None,
         repetition_penalty=1.0,
+        eos_token_id=None,
     ):
         """
         Sampling hierarchy (applied in order, all optional):
@@ -215,15 +115,20 @@ class SimpleTransformerLM(nn.Module):
           5. min-p              — keep tokens where prob(i) >= min_p * prob(argmax)
                             adaptive: bar rises when model is confident,
                             falls when uncertain — best for killing rep loops
+
+        If `eos_token_id` is given, generation stops early once every sequence in
+        the batch has emitted it; already-finished rows are padded with EOS so the
+        returned tensor stays rectangular.
         """
         was_training = self.training
         self.eval()
- 
+
         try:
             if idx.size(1) == 0:
                 raise ValueError("Prompt must contain at least one token")
- 
+
             past_kvs = None
+            finished = torch.zeros(idx.size(0), 1, dtype=torch.bool, device=idx.device)
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -self.block_size:]
                 if past_kvs is None:
@@ -244,9 +149,14 @@ class SimpleTransformerLM(nn.Module):
  
                 if temperature <= 0:
                     next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                    if eos_token_id is not None:
+                        next_token = torch.where(finished, eos_token_id, next_token)
+                        finished = finished | (next_token == eos_token_id)
                     idx = torch.cat([idx, next_token], dim=1)
+                    if eos_token_id is not None and bool(finished.all()):
+                        break
                     continue
- 
+
                 logits = logits / temperature
  
                 # Top-K
@@ -274,8 +184,13 @@ class SimpleTransformerLM(nn.Module):
  
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
+                if eos_token_id is not None:
+                    next_token = torch.where(finished, eos_token_id, next_token)
+                    finished = finished | (next_token == eos_token_id)
                 idx = torch.cat([idx, next_token], dim=1)
- 
+                if eos_token_id is not None and bool(finished.all()):
+                    break
+
             return idx
         finally:
             if was_training:
@@ -385,7 +300,10 @@ class StreamingTokenDataset(IterableDataset):
                 buf = buf[bs:]
 
 
-_liger_ce = LigerCrossEntropyLoss()
+# z-loss (lse_square_scale) penalizes large logit log-sum-exp, stabilizing the
+# output distribution — the standard companion to dropping the tanh logit
+# softcap (PaLM, Chameleon). Uses Liger's built-in implementation.
+_liger_ce = LigerCrossEntropyLoss(lse_square_scale=1e-4)
 
 def chunked_cross_entropy(logits, targets):
     return _liger_ce(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
@@ -422,7 +340,9 @@ def main():
     parser.add_argument("--max-steps",    type=int,   default=9999)
     parser.add_argument("--batch-size",   type=int,   default=99)
     parser.add_argument("--block-size",   type=int,   default=2048)
-    parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
+    # DCP writes a directory of shards (not a single file), so the default is a
+    # directory name rather than a .pt path.
+    parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint")
     parser.add_argument("--resume",       action="store_true")
     parser.add_argument("--vocab-size",     type=int, default=32768)
     parser.add_argument("--tokenizer-path", type=str, default="fineweb_edu_bpe.json")
@@ -523,6 +443,9 @@ def main():
     # scale parameters fights normalization and decaying embeddings harms rare
     # tokens. Only the 2D body matrices warrant decay, and those go to Muon.
     muon_params, adamw_wd_params, adamw_no_wd_params = [], [], []
+    # QK-norm weights are 2D (n_heads, head_dim) but are scale parameters, not
+    # body matrices — they must not go to Muon and must not be weight-decayed.
+    is_scale = lambda n: ("q_norm" in n or "k_norm" in n)
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -530,12 +453,13 @@ def main():
             p.ndim == 2
             and "token_emb" not in name
             and "lm_head" not in name
+            and not is_scale(name)
         )
         if is_body_matrix:
             muon_params.append(p)
-        elif p.ndim >= 2:  # embedding matrix (token_emb / lm_head, tied)
+        elif p.ndim >= 2 and not is_scale(name):  # embedding matrices (token_emb, lm_head)
             adamw_wd_params.append(p)
-        else:              # 1D: norm weights, LayerScale, QK-gain
+        else:              # 1D scale params + 2D QK-norm: norms, LayerScale, QK-gain/norm
             adamw_no_wd_params.append(p)
 
     LR_PEAK = 1e-3
@@ -578,30 +502,10 @@ def main():
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
         return 0.1 * LR_PEAK + 0.5 * (LR_PEAK - 0.1 * LR_PEAK) * (1 + math.cos(math.pi * progress))
 
-    # Async checkpoint: snapshot state dicts on the main thread, write to disk
-    # in a background thread so the training loop isn't blocked by I/O.
-    _ckpt_thread: threading.Thread | None = None
-
-    def save_checkpoint_async(model, optimizers, step, path):
-        nonlocal _ckpt_thread
-        if _ckpt_thread is not None and _ckpt_thread.is_alive():
-            _ckpt_thread.join()
-        # Move tensors to CPU before deepcopy so the snapshot lives in RAM,
-        # not VRAM — otherwise we'd double peak GPU memory at every checkpoint.
-        snapshot = {
-            "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
-            "optimizer_state_dicts": [
-                {k: (v.cpu() if isinstance(v, torch.Tensor) else v)
-                 for k, v in o.state_dict().items()}
-                for o in optimizers
-            ],
-            "step": step,
-        }
-        def _write():
-            torch.save(snapshot, path)
-            print(f"Checkpoint saved to {path} at step {step}")
-        _ckpt_thread = threading.Thread(target=_write, daemon=True)
-        _ckpt_thread.start()
+    # Async checkpoint via PyTorch DCP: save_checkpoint_async stages state on the
+    # main thread and writes in the background. We hold the returned Future and
+    # pass it back each call so the previous write finishes before the next.
+    ckpt_future = None
 
     step = 0
     cache_clear_step = 4          # fresh: empty_cache on the 3rd step
@@ -690,12 +594,14 @@ def main():
                 f"train loss {loss.item():.4f} | val loss {val_loss:.4f} | "
                 f"peak active {peak_alloc:.1f}GB | peak reserved {peak_reserved:.1f}GB"
             )
-            save_checkpoint_async(model, optimizers, step, args.checkpoint)
+            ckpt_future = save_checkpoint_async(
+                model, optimizers, step, args.checkpoint, prev_future=ckpt_future
+            )
 
         step += 1
 
-    if _ckpt_thread is not None:
-        _ckpt_thread.join()
+    if ckpt_future is not None:
+        ckpt_future.result()
 
     # -------------------------------------------------------------------------
     # Generation
@@ -719,6 +625,7 @@ def main():
             out = model.generate(
                 context.clone(),
                 max_new_tokens=args.max_new_tokens,
+                eos_token_id=eot_id,
                 **cfg,
             )
         print(decode(list(out[0].tolist())))

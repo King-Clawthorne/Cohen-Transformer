@@ -10,11 +10,12 @@ Provide a clear, concise project overview and usage guide that helps a developer
 
 ## Action
 
-- Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py` with multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE), LayerScale residual gating, QK-gain, logit softcap, weight-tied embeddings/lm_head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers.
+- Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py`, built from a reusable `Block` module: multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE) with dynamic NTK-aware context scaling, LayerScale residual gating, per-head QK-norm plus learnable QK-gain, an untied LM head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers and early EOS stopping.
 - Switched the optimizer to `torch.optim.Muon` for the body's 2D weight matrices (Newton-Schulz–orthogonalized momentum with the Moonshot `match_rms_adamw` LR adjustment) paired with AdamW for embeddings, RMSNorm gains, and LayerScale vectors.
 - Swapped training data from TinyStories to a streaming `HuggingFaceFW/fineweb-edu` `sample-10BT` pipeline: per-worker shard splitting on an `IterableDataset`, an on-the-fly tokenized held-out val set, and a 32k custom BPE trained on a 50k-doc sample.
-- Runs attention through `F.scaled_dot_product_attention` with the cuDNN fused backend prioritized via `sdpa_kernel(..., set_priority=True)`, folding the learnable per-head QK-gain into `q` so it scales the score before softmax. Training/prefill uses the fast causal flag; KV-cache decode swaps in an explicit lower-right causal mask.
-- Centralized tokenizer training and (multi-optimizer) checkpoint save/load in `modules/utils.py`; core building blocks (`RMSNorm`, `RotaryEmbedding`, `apply_rope`) in `modules/layers.py`.
+- Runs attention through `F.scaled_dot_product_attention` with the cuDNN fused backend prioritized via `sdpa_kernel(..., set_priority=True)`, applying per-head QK-norm before RoPE and folding the learnable per-head QK-gain into `q` so it scales the score before softmax. Training/prefill uses the fast causal flag; KV-cache decode swaps in an explicit lower-right causal mask.
+- Stabilized the output distribution with z-loss (Liger cross-entropy `lse_square_scale`) in place of a tanh logit softcap.
+- Centralized tokenizer training and (multi-optimizer) checkpointing in `modules/utils.py`, using PyTorch's built-in async Distributed Checkpoint (`dcp.async_save`) so saves write in the background without blocking training; core building blocks (`RMSNorm`, `RotaryEmbedding`, `QKNorm`, `Block`, `apply_rope`) in `modules/layers.py`.
 
 ## Result
 
@@ -42,16 +43,9 @@ Provide a clear, concise project overview and usage guide that helps a developer
    python simple.py --resume --max-steps 0 --prompt "The capital of France"
    ```
 
-4. Benchmark the checkpoint on TinyStories validation set:
-
-   ```bash
-   python benchmark.py --checkpoint simple_checkpoint.pt
-   ```
-
 ## Files
 
-- `benchmark_tinystories.py` — script to evaluate perplexity and benchmark throughput of a trained model checkpoint on the TinyStories validation set
 - `simple.py` — model, training loop, FineWeb-Edu streaming dataset, FP8 wiring, cuDNN SDPA path, and generation
-- `modules/layers.py` — `RMSNorm`, `RotaryEmbedding`, `apply_rope`
+- `modules/layers.py` — `RMSNorm`, `RotaryEmbedding` (NTK-aware), `QKNorm`, `Block`, `apply_rope`
 - `modules/muon.py` — Muon optimizer implementation
-- `modules/utils.py` — BPE training/loading, checkpoint save/load (single or list of optimizers), dataset helpers
+- `modules/utils.py` — BPE training/loading, async DCP checkpoint save/load (single or list of optimizers; writes a checkpoint directory), dataset helpers
