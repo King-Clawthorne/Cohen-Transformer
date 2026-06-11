@@ -103,8 +103,7 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--compile-mode", default="default")
-    parser.add_argument("--activation-checkpointing", action="store_true",
-                        help="Pass through to every run (memory knob)")
+    parser.add_argument("--activation-checkpointing", action="store_true")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
