@@ -358,6 +358,14 @@ def main():
     print(f"[{run_id}] done: final val {final_val:.4f} | best {best_val:.4f} | "
           f"{summary['wall_time_s'] / 60:.1f} min")
 
+    # Persistent DataLoader workers + CUDA threads can abort during normal
+    # interpreter teardown (PyGILState_Release fatal error), turning a
+    # successful run into a nonzero exit code. All results are on disk at
+    # this point, so skip teardown entirely.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 
 if __name__ == "__main__":
     main()
