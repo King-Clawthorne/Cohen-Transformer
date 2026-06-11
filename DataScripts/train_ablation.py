@@ -38,6 +38,9 @@ os.environ.setdefault("PYTHONWARNINGS", "ignore")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# ptxas segfaults (-11) emitting line info for the FlexAttention backward
+# kernel on consumer Blackwell (sm_120a); line info is only for profilers.
+os.environ.setdefault("TRITON_DISABLE_LINE_INFO", "1")
 
 import torch
 import torch.nn.functional as F
