@@ -361,7 +361,14 @@ def main():
     # Persistent DataLoader workers + CUDA threads can abort during normal
     # interpreter teardown (PyGILState_Release fatal error), turning a
     # successful run into a nonzero exit code. All results are on disk at
-    # this point, so skip teardown entirely.
+    # this point, so shut the workers down explicitly and skip the rest of
+    # teardown. (Without the explicit shutdown, os._exit kills the workers
+    # mid-handshake and the resource_sharer thread prints harmless
+    # ConnectionResetError tracebacks.)
+    del train_iter
+    for loader in (train_loader, val_loader):
+        if loader._iterator is not None:
+            loader._iterator._shutdown_workers()
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
