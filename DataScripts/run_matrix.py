@@ -111,6 +111,12 @@ def main():
     runs_dir = out_dir / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fail fast if the pretokenized data isn't there (train_ablation.py
+    # default vocab is 8192); otherwise all jobs would fail one by one.
+    if not args.dry_run and not list((out_dir / "tokens").glob("meta_*.json")):
+        sys.exit("Pretokenized data not found in DataOutput/tokens.\n"
+                 "Run once first:  python DataScripts/prepare_data.py")
+
     matrix = build_matrix()
     jobs = []
     for seed in range(args.seeds):
