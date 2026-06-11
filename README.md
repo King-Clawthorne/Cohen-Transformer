@@ -10,12 +10,12 @@ Provide a clear, concise project overview and usage guide that helps a developer
 
 ## Action
 
-- Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py`, built from a reusable `Block` module: multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE) with dynamic NTK-aware context scaling, LayerScale residual gating, per-head QK-norm plus learnable QK-gain, an untied LM head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers that runs until every sequence in the batch emits EOS (a valid `eos_token_id` is required — EOS is the only stop condition).
+- Implemented a minimal ~100M-parameter decoder-only transformer in `simple.py`, built from a reusable `Block` module: multi-head attention, SwiGLU MLP, RMSNorm, rotary position embeddings (RoPE) with dynamic NTK-aware context scaling, LayerScale residual gating, per-head QK-norm plus learnable QK-gain, an untied LM head, and KV-cache-aware generation with top-k / top-p / min-p / repetition-penalty samplers. Generation runs until every sequence in the batch emits EOS or until `max_new_tokens` tokens have been appended (whichever comes first); at least one of `eos_token_id` / `max_new_tokens` is required so decoding always has a stop condition.
 - Uses a vendored Muon optimizer (`modules/muon.py`) for the body's 2D weight matrices (Newton-Schulz–orthogonalized momentum with the Moonshot `match_rms_adamw` LR adjustment, weight decay 0.1), paired with AdamW for the embedding / LM-head matrices (weight decay 0.1) and the 1D scale parameters — RMSNorm gains, LayerScale, and QK-gain/QK-norm (weight decay 0).
-- Streams `roneneldan/TinyStories` through a tokenize-on-the-fly `IterableDataset`: per-worker shard splitting so workers never replay the same documents, a fixed held-out validation set (the first 2000 documents, tokenized once at startup), and a 32k custom byte-level BPE trained on a 50k-document sample of the stream.
+- Streams the configured corpus through a tokenize-on-the-fly `IterableDataset`: per-worker shard splitting so workers never replay the same documents, a fixed held-out validation set (the first 2000 documents, tokenized once at startup), and a 32k custom byte-level BPE trained on a 50k-document sample of the stream. The corpus is a single knob — `DATASET_PATH` / `DATASET_NAME` / `DATASET_SPLIT` in `main()` are passed straight to HF `load_dataset(...)`, so any streaming dataset exposing a `"text"` column works; it defaults to `roneneldan/TinyStories`.
 - Runs training/eval attention through FlexAttention with a fused document `BlockMask`, applying per-head QK-norm before RoPE and folding the learnable per-head QK-gain into `q` so it scales the score before softmax. KV-cache decode falls back to `F.scaled_dot_product_attention` (cuDNN fused backend prioritized via `sdpa_kernel(..., set_priority=True)`) with an explicit lower-right causal mask.
 - Packs documents end-to-end separated by `<|endoftext|>` and builds a block-diagonal document mask (`build_document_block_mask`) on the training/eval path as a FlexAttention `BlockMask`, so attention never crosses a document boundary within a packed block; the mask is fused into the attention kernel and already encodes causality.
-- Stabilized the output distribution with z-loss (Liger cross-entropy `lse_square_scale`) in place of a tanh logit softcap.
+- Computes the training loss with `LigerFusedLinearCrossEntropyLoss`, which fuses the final `lm_head` projection into the cross-entropy reduction so the full `[B*T, vocab]` logits are never materialized (a major activation-memory saving at large vocab) — the model's forward returns pre-projection hidden states on the train/eval path and hands the `lm_head` weight to the loss. Stabilized the output distribution with z-loss (`lse_square_scale`) in place of a tanh logit softcap.
 - Centralized tokenizer training and (multi-optimizer) checkpointing in `modules/utils.py`, using PyTorch's built-in async Distributed Checkpoint (`dcp.async_save`) so saves write in the background without blocking training; core building blocks (`RMSNorm`, `RotaryEmbedding`, `QKNorm`, `Block`, `apply_rope`) in `modules/layers.py`.
 
 ## Result
@@ -32,17 +32,20 @@ Provide a clear, concise project overview and usage guide that helps a developer
    pip install -r requirements.txt
    ```
 
-2. Train:
+2. Train (defaults: `--max-steps 1000 --batch-size 1 --block-size 2048 --grad-accum 99`):
 
    ```bash
-   python simple.py --max-steps 9999 --batch-size 99 --block-size 2048
+   python simple.py --max-steps 1000 --batch-size 1 --block-size 2048 --grad-accum 99
    ```
 
 3. Resume from a checkpoint and skip straight to generation:
 
    ```bash
-   python simple.py --resume --max-steps 0 --prompt "The capital of France"
+   python simple.py --resume --max-steps 0 --prompt "Once upon a time"
    ```
+
+   Checkpoints are written by PyTorch Distributed Checkpoint as a *directory* of
+   shards (default `simple_checkpoint`), not a single `.pt` file.
 
 ## Files
 
