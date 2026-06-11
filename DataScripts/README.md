@@ -25,7 +25,11 @@ are held fixed across all runs.
 Run everything from the **repo root**:
 
 ```bash
-# 1. Preview the run list (~26 configs per seed) without training
+# 0. One-time: download + tokenize the corpus to local .bin files
+#    (training runs then need no network at all)
+python DataScripts/prepare_data.py
+
+# 1. Preview the run list (~22 configs per seed) without training
 python DataScripts/run_matrix.py --dry-run
 
 # 2. Run the full matrix (sequential, one GPU; resumable — re-running

@@ -1,7 +1,8 @@
 """Single ablation training run for the factorial study.
 
-Trains one configuration of AblationTransformerLM on the streaming corpus and
-writes machine-readable results to DataOutput/runs/<run_id>/:
+Trains one configuration of AblationTransformerLM on the pretokenized local
+corpus (run DataScripts/prepare_data.py once first) and writes
+machine-readable results to DataOutput/runs/<run_id>/:
 
   config.json   - full resolved configuration of the run
   log.jsonl     - one JSON object per eval point (step, losses, lr, tokens, time)
@@ -42,26 +43,38 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # kernel on consumer Blackwell (sm_120a); line info is only for profilers.
 os.environ.setdefault("TRITON_DISABLE_LINE_INFO", "1")
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from liger_kernel.transformers.fused_linear_cross_entropy import (
     LigerFusedLinearCrossEntropyLoss,
 )
 
-# Reuse the data pipeline and document masking from the main training script.
-from simple import (
-    stream_dataset,
-    precompute_val_tokens,
-    StreamingTokenDataset,
-    TokenDataset,
-    build_document_block_mask,
-    VAL_DOCS,
-)
+# Reuse the document masking from the main training script.
+from simple import build_document_block_mask
 from modules.muon import Muon
-from modules.utils import train_or_load_bpe
 from DataScripts.ablation_model import AblationTransformerLM
 from DataScripts.common import FACTORS, run_id_from_config
+
+
+class BinTokenDataset(Dataset):
+    """Non-overlapping (x, y) blocks from a memory-mapped uint16 token file
+    written by prepare_data.py. No tokenization, no network: every run reads
+    identical batches in identical order."""
+
+    def __init__(self, path, block_size):
+        self.tokens = np.memmap(path, dtype=np.uint16, mode="r")
+        self.block_size = block_size
+
+    def __len__(self):
+        return (len(self.tokens) - 1) // self.block_size
+
+    def __getitem__(self, i):
+        a = np.asarray(
+            self.tokens[i * self.block_size : (i + 1) * self.block_size + 1],
+            dtype=np.int64)
+        return torch.from_numpy(a[:-1]), torch.from_numpy(a[1:])
 
 
 def build_optimizers(model, optimizer_kind, lr_peak):
@@ -175,9 +188,9 @@ def main():
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-embd", type=int, default=768)
     parser.add_argument("--vocab-size", type=int, default=8192)
-    # Default encodes the vocab size (e.g. bpe_8192.json) so a cached
-    # tokenizer trained at a different vocab size is never silently reused.
-    parser.add_argument("--tokenizer-path", default=None)
+    parser.add_argument("--data-dir", default=str(REPO_ROOT / "DataOutput" / "tokens"),
+                        help="Directory of pretokenized .bin/meta files "
+                             "written by prepare_data.py")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "DataOutput" / "runs"))
     parser.add_argument("--run-id", default=None,
                         help="Override the auto-generated run directory name")
@@ -196,38 +209,29 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    DATASET_PATH = "roneneldan/TinyStories"
-    DATASET_NAME = None
-    DATASET_SPLIT = "train"
+    # Pretokenized local data only (see prepare_data.py): no network, no
+    # tokenization, and identical batches across every run in the matrix.
+    data_dir = Path(args.data_dir)
+    meta_path = data_dir / f"meta_{args.vocab_size}.json"
+    if not meta_path.exists():
+        sys.exit(f"Pretokenized data not found at {meta_path}.\n"
+                 f"Run once first:  python DataScripts/prepare_data.py "
+                 f"--vocab-size {args.vocab_size}")
+    meta = json.loads(meta_path.read_text())
+    eot_id = meta["eot_id"]
 
-    def corpus_iter():
-        for ex in stream_dataset(DATASET_PATH, DATASET_NAME, split=DATASET_SPLIT, take=50_000):
-            t = ex["text"].strip()
-            if t:
-                yield t
+    train_dataset = BinTokenDataset(data_dir / meta["train_file"], args.block_size)
+    val_dataset = BinTokenDataset(data_dir / meta["val_file"], args.block_size)
 
-    tokenizer_path = args.tokenizer_path or str(
-        REPO_ROOT / f"bpe_{args.vocab_size}.json")
-    tokenizer = train_or_load_bpe(corpus_iter(), vocab_size=args.vocab_size,
-                                  save_path=tokenizer_path)
-    eot_id = tokenizer.token_to_id("<|endoftext|>")
-
-    train_dataset = StreamingTokenDataset(
-        tokenizer, args.block_size, eot_id, DATASET_PATH, DATASET_NAME,
-        dataset_split=DATASET_SPLIT, skip_docs=VAL_DOCS)
-    val_data = precompute_val_tokens(tokenizer, eot_id, DATASET_PATH,
-                                     DATASET_NAME, dataset_split=DATASET_SPLIT)
-    val_dataset = TokenDataset(val_data, args.block_size)
-
-    loader_kwargs = dict(num_workers=2, pin_memory=True, persistent_workers=True,
-                         prefetch_factor=4, drop_last=True)
+    # memmap reads are cheap: no worker processes needed (also sidesteps
+    # multiprocessing teardown flakiness entirely).
+    loader_kwargs = dict(num_workers=0, pin_memory=True, drop_last=True)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                               shuffle=False, **loader_kwargs)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
                             shuffle=False, **loader_kwargs)
 
-    vocab_size = tokenizer.get_vocab_size()
-    padded_vocab_size = ((vocab_size + 63) // 64) * 64
+    padded_vocab_size = ((meta["vocab_size"] + 63) // 64) * 64
 
     model = AblationTransformerLM(
         padded_vocab_size,
@@ -266,7 +270,7 @@ def main():
 
     (run_dir / "config.json").write_text(json.dumps(
         {**cfg, "run_id": run_id, "n_params": n_params,
-         "dataset": DATASET_PATH, "device": device,
+         "dataset": meta["dataset"], "device": device,
          "tokens_per_step": args.batch_size * args.grad_accum * args.block_size},
         indent=2))
     log_path = run_dir / "log.jsonl"
@@ -366,9 +370,6 @@ def main():
     # mid-handshake and the resource_sharer thread prints harmless
     # ConnectionResetError tracebacks.)
     del train_iter
-    for loader in (train_loader, val_loader):
-        if loader._iterator is not None:
-            loader._iterator._shutdown_workers()
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
