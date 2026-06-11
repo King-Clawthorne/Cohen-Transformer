@@ -24,6 +24,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -101,7 +102,15 @@ class AblationBlock(nn.Module):
         if self.qk_gain is not None:
             q = q * self.qk_gain.view(1, self.n_heads, 1, 1).to(q.dtype)
 
-        y = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
+        if isinstance(block_mask, torch.Tensor):
+            # Dense-mask fallback (--attention sdpa): same causal+same-document
+            # semantics as the FlexAttention BlockMask, for machines where
+            # Triton can't compile the flex backward kernel (e.g. ptxas
+            # segfaults on sm_120a consumer Blackwell).
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=block_mask, scale=self.scale)
+        else:
+            y = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
         y = self.proj(y)
         x = residual + (self.ls_attn * y if self.ls_attn is not None else y)

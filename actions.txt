@@ -60,6 +60,14 @@ Tell me the runs are done. I will read DataOutput/ (especially
 analysis/ and the per-run summary.json files) and write the paper.
 Please don't delete or move anything inside DataOutput/ before that.
 
+If you hit the ptxas crash (PTXAS error code -11 in the flex attention
+backward kernel, seen on RTX 50-series / sm_120a):
+  1. First try:   TRITON_DISABLE_LINE_INFO=1 python DataScripts/run_matrix.py ...
+     (PowerShell:  $env:TRITON_DISABLE_LINE_INFO = "1"; python ...)
+  2. If it still crashes, add --attention sdpa to the run_matrix.py command.
+     Identical masking semantics, avoids the broken Triton kernel; a bit
+     slower and more memory. Use the SAME choice for ALL runs (pilot + real).
+
 Notes
 -----
 - The tokenizer (bpe.json) is trained once on first run and cached; later

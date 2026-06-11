@@ -40,6 +40,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from liger_kernel.transformers.fused_linear_cross_entropy import (
     LigerFusedLinearCrossEntropyLoss,
@@ -90,6 +91,22 @@ def build_optimizers(model, optimizer_kind, lr_peak):
     return [adamw_opt]
 
 
+def build_dense_document_mask(idx, eot_id):
+    """Dense bool [B, 1, T, T] mask: causal AND same-document.
+
+    Identical semantics to simple.build_document_block_mask, but as a plain
+    tensor for F.scaled_dot_product_attention (--attention sdpa fallback on
+    machines where Triton can't compile the FlexAttention backward kernel).
+    """
+    bsz, seq_len = idx.shape
+    prev_is_eot = F.pad((idx == eot_id)[:, :-1], (1, 0), value=False)
+    doc_ids = prev_is_eot.cumsum(dim=1)
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool,
+                                   device=idx.device))
+    same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]
+    return (causal & same_doc)[:, None]
+
+
 def make_loss(z_loss, softcap):
     return LigerFusedLinearCrossEntropyLoss(
         lse_square_scale=1e-4 if z_loss else 0.0,
@@ -97,7 +114,7 @@ def make_loss(z_loss, softcap):
     )
 
 
-def estimate_loss(model, loss_fn, val_loader, device, eot_id, eval_iters):
+def estimate_loss(model, loss_fn, val_loader, device, mask_fn, eval_iters):
     model.eval()
     losses = []
     autocast_ctx = torch.amp.autocast(device, dtype=torch.bfloat16,
@@ -109,7 +126,7 @@ def estimate_loss(model, loss_fn, val_loader, device, eot_id, eval_iters):
             torch.compiler.cudagraph_mark_step_begin()
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
-            block_mask = build_document_block_mask(xb, eot_id)
+            block_mask = mask_fn(xb)
             with autocast_ctx:
                 hidden = model(xb, block_mask=block_mask)
                 loss = loss_fn(model.lm_head.weight,
@@ -146,6 +163,10 @@ def main():
     parser.add_argument("--activation-checkpointing", action="store_true",
                         help="Recompute block activations in backward (memory "
                              "knob; ~25-30%% slower, results unchanged)")
+    parser.add_argument("--attention", choices=["flex", "sdpa"], default="flex",
+                        help="sdpa = dense-mask fallback with identical "
+                             "document-masking semantics, for machines where "
+                             "Triton can't compile the flex backward kernel")
     # Model size (held fixed across the matrix)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--n-heads", type=int, default=12)
@@ -227,6 +248,11 @@ def main():
     optimizers = build_optimizers(model, args.optimizer, args.lr_peak)
     loss_fn = make_loss(args.z_loss, args.softcap)
 
+    if args.attention == "sdpa":
+        mask_fn = lambda xb: build_dense_document_mask(xb, eot_id)
+    else:
+        mask_fn = lambda xb: build_document_block_mask(xb, eot_id)
+
     warmup_steps = min(99, max(0, args.max_steps - 1))
 
     def get_lr(step):
@@ -274,7 +300,7 @@ def main():
             xb, yb = next_batch()
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
-            block_mask = build_document_block_mask(xb, eot_id)
+            block_mask = mask_fn(xb)
             with autocast_ctx:
                 hidden = model(xb, block_mask=block_mask)
                 micro_loss = loss_fn(model.lm_head.weight,
@@ -295,7 +321,7 @@ def main():
 
         if step % args.eval_interval == 0 or step == args.max_steps - 1 or diverged:
             val_loss = estimate_loss(model, loss_fn, val_loader, device,
-                                     eot_id, args.eval_iters)
+                                     mask_fn, args.eval_iters)
             best_val = min(best_val, val_loss)
             rec = {"step": step, "lr": lr, "train_loss": train_loss,
                    "val_loss": val_loss, "grad_norm": float(grad_norm),
@@ -309,7 +335,7 @@ def main():
             break
 
     final_val = (float("nan") if diverged else
-                 estimate_loss(model, loss_fn, val_loader, device, eot_id,
+                 estimate_loss(model, loss_fn, val_loader, device, mask_fn,
                                args.final_eval_iters))
     log_f.close()
 
