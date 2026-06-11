@@ -420,8 +420,8 @@ def main():
     parser = argparse.ArgumentParser(description="SimpleTransformerLM")
  
     # Training
-    parser.add_argument("--max-steps",    type=int,   default=9999)
-    parser.add_argument("--batch-size",   type=int,   default=99)
+    parser.add_argument("--max-steps",    type=int,   default=1000)
+    parser.add_argument("--batch-size",   type=int,   default=1)
     parser.add_argument("--block-size",   type=int,   default=2048)
     # DCP writes a directory of shards (not a single file), so the default is a
     # directory name rather than a .pt path.
@@ -434,9 +434,9 @@ def main():
     parser.add_argument("--tokenizer-path", type=str, default="bpe.json")
     parser.add_argument("--compile-mode", type=str,   default="default",
                         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
-    parser.add_argument("--eval-interval", type=int, default=999)
-    parser.add_argument("--grad-accum",   type=int, default=1)
-    parser.add_argument("--prompt",       type=str, default="The capital of France")
+    parser.add_argument("--eval-interval", type=int, default=1)
+    parser.add_argument("--grad-accum",   type=int, default=99)
+    parser.add_argument("--prompt",       type=str, default="Once upon a time")
 
     args = parser.parse_args()
  
