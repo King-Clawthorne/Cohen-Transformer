@@ -527,6 +527,10 @@ def main():
     # tile configs. First-step compile will be slow (~5-10 min).
     # Drop fullgraph=True if modules.layers has graph breaks.
     if args.compile_mode != "none":
+        # Silence the autotuner's per-kernel benchmark tables on stderr.
+        import torch._inductor.select_algorithm
+        torch._inductor.select_algorithm.PRINT_AUTOTUNE = False
+        torch._inductor.config.max_autotune_report_choices_stats = False
         model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
     # Hybrid optimizer: Muon for 2D body matrices, AdamW for everything else.
@@ -600,12 +604,10 @@ def main():
     ckpt_future = None
 
     step = 0
-    cache_clear_step = 4          # fresh: empty_cache on the 3rd step
     train_iter = iter(train_loader)
     if args.resume:
         loaded_step = load_checkpoint(model, optimizers, args.checkpoint, device)
         step = loaded_step + 1
-        cache_clear_step += loaded_step
         if step >= max_steps:
             print(
                 f"Checkpoint step {loaded_step} already reaches/exceeds "
@@ -672,10 +674,6 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
-
-        if step == cache_clear_step:
-            torch.cuda.empty_cache()
-            print(f"CUDA cache cleared to reduce fragmentation for KV cache.")
 
         if step % eval_interval == 0:
             val_loss  = estimate_loss(model, val_loader, device, eot_id)
