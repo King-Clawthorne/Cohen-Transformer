@@ -528,9 +528,9 @@ def main():
     # Drop fullgraph=True if modules.layers has graph breaks.
     if args.compile_mode != "none":
         # Silence the autotuner's per-kernel benchmark tables on stderr.
-        import torch._inductor.select_algorithm
-        torch._inductor.select_algorithm.PRINT_AUTOTUNE = False
-        torch._inductor.config.max_autotune_report_choices_stats = False
+        from torch._inductor import config as inductor_config, select_algorithm
+        select_algorithm.PRINT_AUTOTUNE = False
+        inductor_config.max_autotune_report_choices_stats = False
         model = torch.compile(model, mode=args.compile_mode, fullgraph=True)
  
     # Hybrid optimizer: Muon for 2D body matrices, AdamW for everything else.
