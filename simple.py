@@ -20,11 +20,12 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
 from modules.muon import Muon
 
-from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
 from modules.layers import RMSNorm, RotaryEmbedding, Block
 from modules.utils import (
@@ -45,6 +46,33 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "expandable_segments:True",
 )
+
+def build_document_block_mask(idx, eot_id):
+    """Block-diagonal causal BlockMask for FlexAttention.
+
+    Documents are packed end-to-end and separated by `eot_id` (the eot token is
+    the last token of its document). A token starts a new document iff the
+    previous token was an eot, so a cumulative count of those boundaries gives
+    each token a document id. A query may attend to earlier keys that share its
+    document id — i.e. causal AND same-document.
+
+    Built eagerly (outside the compiled model) and passed into the forward pass;
+    `flex_attention` fuses the mask into the attention kernel. Returns a
+    BlockMask broadcast over heads (H=None).
+    """
+    bsz, seq_len = idx.shape
+    # prev_is_eot[b, i] = (idx[b, i-1] == eot_id), with False at position 0.
+    prev_is_eot = F.pad((idx == eot_id)[:, :-1], (1, 0), value=False)
+    doc_ids = prev_is_eot.cumsum(dim=1)                       # [B, seq]
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
+
+    return create_block_mask(
+        mask_mod, B=bsz, H=None, Q_LEN=seq_len, KV_LEN=seq_len,
+        device=idx.device, _compile=True,
+    )
+
 
 class SimpleTransformerLM(nn.Module):
     def __init__(
@@ -92,28 +120,7 @@ class SimpleTransformerLM(nn.Module):
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
-    def _build_document_mask(self, idx):
-        """Block-diagonal causal mask that keeps attention inside each document.
-
-        Documents are packed end-to-end and separated by `eot_id` (the eot token
-        is the last token of its document). A token starts a new document iff the
-        previous token was an eot, so a cumulative count of those boundaries
-        gives each token a document id. Tokens may attend to earlier tokens that
-        share their document id — i.e. causal AND same-document.
-
-        Returns a boolean mask of shape [B, 1, seq, seq] (True = attend) suitable
-        for SDPA's attn_mask, broadcast over heads.
-        """
-        # prev_is_eot[b, i] = (idx[b, i-1] == eot_id), with False at position 0.
-        prev_is_eot = F.pad((idx == self.eot_id)[:, :-1], (1, 0), value=False)
-        doc_ids = prev_is_eot.cumsum(dim=1)                       # [B, seq]
-        same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]     # [B, seq, seq]
-        causal = torch.ones(
-            idx.size(1), idx.size(1), dtype=torch.bool, device=idx.device
-        ).tril()
-        return (same_doc & causal).unsqueeze(1)                   # [B, 1, seq, seq]
-
-    def forward(self, idx, past_kvs=None, use_cache=False):
+    def forward(self, idx, block_mask=None, past_kvs=None, use_cache=False, return_hidden=False):
         bsz, seq_len = idx.shape
         if seq_len > self.block_size:
             raise ValueError("Sequence length exceeds block_size")
@@ -121,12 +128,10 @@ class SimpleTransformerLM(nn.Module):
         x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
 
-        # Document masking only applies to the full-context training/eval path.
-        # During cached generation each call extends a single sequence, so the
-        # plain causal path in Block handles it.
-        attn_mask = None
-        if self.eot_id is not None and not use_cache:
-            attn_mask = self._build_document_mask(idx)
+        # Document masking (a FlexAttention BlockMask) is built by the caller and
+        # applies only to the full-context training/eval path. During cached
+        # generation each call extends a single sequence, so the plain causal
+        # SDPA path in Block handles it and block_mask stays None.
 
         # RoPE cos/sin are shared across all blocks: compute once for this step.
         offset = past_kvs[0][0].size(2) if past_kvs is not None else 0
@@ -134,11 +139,17 @@ class SimpleTransformerLM(nn.Module):
 
         for layer, block in enumerate(self.blocks):
             past_kv = past_kvs[layer] if past_kvs is not None else None
-            x, new_kv = block(x, cos, sin, attn_mask=attn_mask, past_kv=past_kv, use_cache=use_cache)
+            x, new_kv = block(x, cos, sin, block_mask=block_mask, past_kv=past_kv, use_cache=use_cache)
             if use_cache:
                 new_kvs.append(new_kv)
 
         x = self.ln_f(x)
+        # Training/eval uses LigerFusedLinearCrossEntropy, which fuses the
+        # lm_head projection into the loss — so return the hidden states and let
+        # the caller apply the (weight-fused) loss without ever materializing the
+        # full logits. Generation still needs real logits to sample from.
+        if return_hidden:
+            return x, new_kvs
         logits = self.lm_head(x)
         return logits, new_kvs
 
@@ -152,6 +163,7 @@ class SimpleTransformerLM(nn.Module):
         min_p=None,
         repetition_penalty=1.0,
         eos_token_id=None,
+        max_new_tokens=None,
     ):
         """
         Sampling hierarchy (applied in order, all optional):
@@ -164,9 +176,11 @@ class SimpleTransformerLM(nn.Module):
                             falls when uncertain — best for killing rep loops
 
         Generation runs until every sequence in the batch has emitted
-        `eos_token_id`; already-finished rows are padded with EOS so the returned
-        tensor stays rectangular. EOS is the only thing that ends generation, so
-        a valid `eos_token_id` is required to avoid looping forever.
+        `eos_token_id`, or until `max_new_tokens` tokens have been appended
+        (whichever comes first). Already-finished rows are padded with EOS so the
+        returned tensor stays rectangular. A valid `eos_token_id` is required;
+        without it (and without a `max_new_tokens` cap) generation would loop
+        forever.
         """
         was_training = self.training
         self.eval()
@@ -175,14 +189,18 @@ class SimpleTransformerLM(nn.Module):
             if idx.size(1) == 0:
                 raise ValueError("Prompt must contain at least one token")
 
-            if eos_token_id is None:
+            if eos_token_id is None and max_new_tokens is None:
                 raise ValueError(
-                    "eos_token_id is required: generation only stops at EOS"
+                    "generation needs a stop condition: pass eos_token_id, "
+                    "max_new_tokens, or both"
                 )
 
             past_kvs = None
             finished = torch.zeros(idx.size(0), 1, dtype=torch.bool, device=idx.device)
+            num_generated = 0
             while True:
+                if max_new_tokens is not None and num_generated >= max_new_tokens:
+                    break
                 idx_cond = idx[:, -self.block_size:]
                 if past_kvs is None:
                     logits, past_kvs = self.forward(idx_cond, use_cache=True)
@@ -206,6 +224,7 @@ class SimpleTransformerLM(nn.Module):
                         next_token = torch.where(finished, eos_token_id, next_token)
                         finished = finished | (next_token == eos_token_id)
                     idx = torch.cat([idx, next_token], dim=1)
+                    num_generated += 1
                     if eos_token_id is not None and bool(finished.all()):
                         break
                     continue
@@ -241,6 +260,7 @@ class SimpleTransformerLM(nn.Module):
                     next_token = torch.where(finished, eos_token_id, next_token)
                     finished = finished | (next_token == eos_token_id)
                 idx = torch.cat([idx, next_token], dim=1)
+                num_generated += 1
                 if eos_token_id is not None and bool(finished.all()):
                     break
 
@@ -353,17 +373,26 @@ class StreamingTokenDataset(IterableDataset):
                 buf = buf[bs:]
 
 
+# Fused linear cross entropy: Liger fuses the final lm_head projection with the
+# cross-entropy reduction, so the full [B*T, vocab] logits are never
+# materialized (a major activation-memory saving at large vocab). The model's
+# forward therefore returns the pre-projection hidden states on the training
+# path, and the lm_head weight is handed to the loss here.
 # z-loss (lse_square_scale) penalizes large logit log-sum-exp, stabilizing the
 # output distribution — the standard companion to dropping the tanh logit
-# softcap (PaLM, Chameleon). Uses Liger's built-in implementation.
-_liger_ce = LigerCrossEntropyLoss(lse_square_scale=1e-4)
+# softcap (PaLM, Chameleon).
+_liger_flce = LigerFusedLinearCrossEntropyLoss(lse_square_scale=1e-4)
 
-def chunked_cross_entropy(logits, targets):
-    return _liger_ce(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+def fused_linear_cross_entropy(hidden, lm_head_weight, targets):
+    return _liger_flce(
+        lm_head_weight,
+        hidden.reshape(-1, hidden.size(-1)),
+        targets.reshape(-1),
+    )
 
 
 
-def estimate_loss(model, val_loader, device, eval_iters=20):
+def estimate_loss(model, val_loader, device, eot_id, eval_iters=20):
     model.eval()
     losses = []
     # Match the training dtype: without autocast the eval forward materializes
@@ -378,9 +407,10 @@ def estimate_loss(model, val_loader, device, eval_iters=20):
             # clobbering a tensor that may still be referenced.
             torch.compiler.cudagraph_mark_step_begin()
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            block_mask = build_document_block_mask(xb, eot_id) if eot_id is not None else None
             with autocast_ctx:
-                logits, _ = model(xb, use_cache=False)
-                loss = chunked_cross_entropy(logits, yb)
+                hidden, _ = model(xb, block_mask=block_mask, use_cache=False, return_hidden=True)
+                loss = fused_linear_cross_entropy(hidden, model.lm_head.weight, yb)
             losses.append(loss.item())
 
     model.train()
@@ -631,9 +661,10 @@ def main():
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
 
+            block_mask = build_document_block_mask(xb, eot_id) if eot_id is not None else None
             with autocast_ctx:
-                logits, _ = model(xb, use_cache=False)
-                micro_loss = chunked_cross_entropy(logits, yb) / args.grad_accum
+                hidden, _ = model(xb, block_mask=block_mask, use_cache=False, return_hidden=True)
+                micro_loss = fused_linear_cross_entropy(hidden, model.lm_head.weight, yb) / args.grad_accum
 
             micro_loss.backward()
             loss += micro_loss.detach()
@@ -647,7 +678,7 @@ def main():
             print(f"CUDA cache cleared to reduce fragmentation for KV cache.")
 
         if step % eval_interval == 0:
-            val_loss  = estimate_loss(model, val_loader, device)
+            val_loss  = estimate_loss(model, val_loader, device, eot_id)
             peak_alloc = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
             peak_reserved = torch.cuda.max_memory_reserved() / 1e9 if device == "cuda" else 0.0
             if device == "cuda": torch.cuda.reset_peak_memory_stats()
@@ -687,6 +718,7 @@ def main():
             out = model.generate(
                 context.clone(),
                 eos_token_id=eot_id,
+                max_new_tokens=256,
                 **cfg,
             )
         print(decode(list(out[0].tolist())))
